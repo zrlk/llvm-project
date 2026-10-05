@@ -1066,6 +1066,118 @@ void FactsGenerator::handleLifetimeCaptureBy(const FunctionDecl *FD,
   }
 }
 
+namespace {
+/// What the signature says about one argument of a call.
+struct ArgLifetimeInfo {
+  /// The lifetimes written for this argument, or null if it writes none.
+  const LifetimeList *Lifetimes = nullptr;
+  /// The parameter the argument binds to, or null for the implicit object
+  /// argument, which has no `ParmVarDecl`.
+  const ParmVarDecl *Param = nullptr;
+};
+} // namespace
+
+/// Returns what the signature says about argument \p I.
+///
+/// For instance methods (other than constructors) `Args[0]` is the implicit
+/// object argument. Its lifetimes are written after the parameter list, which
+/// is where `LifetimeSignature` records them as `FunctionType`.
+static ArgLifetimeInfo getLifetimesForArg(const FunctionDecl *FD,
+                                          const LifetimeSignature &Sig,
+                                          unsigned I) {
+  if (const auto *Method = dyn_cast<CXXMethodDecl>(FD);
+      Method && Method->isInstance() && !isa<CXXConstructorDecl>(FD)) {
+    if (I == 0)
+      return {&Sig.FunctionType, /*Param=*/nullptr};
+    --I;
+  }
+  if (I >= Sig.Params.size())
+    return {};
+  return {&Sig.Params[I],
+          I < FD->getNumParams() ? FD->getParamDecl(I) : nullptr};
+}
+
+bool FactsGenerator::handleNamedLifetimeCall(const FunctionDecl *FD,
+                                             llvm::ArrayRef<const Expr *> Args,
+                                             OriginList *CallList) {
+  LifetimeSignature Sig = getLifetimeSignature(AC.getASTContext(), FD);
+  if (Sig.empty())
+    return false;
+
+  // Walk the arguments once, collecting the origins written with each named
+  // lifetime and recording the obligations `$static` positions impose.
+  llvm::SmallDenseMap<llvm::StringRef, llvm::SmallVector<OriginID, 2>, 4>
+      ByLifetime;
+  for (unsigned I = 0; I < Args.size(); ++I) {
+    auto [Lifetimes, Param] = getLifetimesForArg(FD, Sig, I);
+    if (!Lifetimes || Lifetimes->empty())
+      continue;
+    OriginList *ArgList = getOriginsList(*Args[I]);
+    if (!ArgList)
+      continue;
+    // The lifetime list and the origin list are both ordered outermost-first.
+    // Shapes can still disagree (for example when an lvalue argument carries
+    // an extra synthetic level), so stop at whichever runs out rather than
+    // asserting; the cost of a mismatch is a missed flow, not a wrong one.
+    for (const LifetimeVar &LV : *Lifetimes) {
+      if (!ArgList)
+        break;
+      switch (LV.getKind()) {
+      case LifetimeVar::Kind::Named:
+        ByLifetime[LV.getName()].push_back(ArgList->getOuterOriginID());
+        break;
+      case LifetimeVar::Kind::Static:
+        // Unlike a named lifetime, which the caller instantiates with whatever
+        // it has, `$static` is a fixed demand: the argument must be storage
+        // that never expires. That is a check, not a flow.
+        CurrentBlockFacts.push_back(FactMgr.createFact<StaticObligationFact>(
+            ArgList->getOuterOriginID(), Args[I], Param));
+        break;
+      case LifetimeVar::Kind::Unknown:
+      case LifetimeVar::Kind::Elided:
+        break;
+      }
+      ArgList = ArgList->peelOuterOrigin();
+    }
+  }
+
+  if (!CallList)
+    return false;
+
+  // Substitution only governs the result, so it only applies when the return
+  // position actually says something. A signature that annotates parameters
+  // but leaves the return bare says nothing about what the call yields; in
+  // that case `lifetimebound` remains the best available information and the
+  // existing path is left alone.
+  if (llvm::all_of(Sig.Return, [](const LifetimeVar &LV) {
+        return LV.getKind() == LifetimeVar::Kind::Elided;
+      }))
+    return false;
+
+  // Flow the collected origins into each result level naming that lifetime.
+  // A `$static` or `$unknown` level contributes nothing: the first cannot
+  // dangle, and the second is an explicit assertion that no lifetime applies.
+  // Both therefore leave the result with an empty loan set, which is also what
+  // suppresses the `lifetimebound` union for an `$unknown` return.
+  OriginList *ResultLevel = CallList;
+  for (const LifetimeVar &LV : Sig.Return) {
+    if (!ResultLevel)
+      break;
+    if (LV.getKind() == LifetimeVar::Kind::Named) {
+      // A lifetime that appears on the return but on no argument borrows from
+      // nothing, so the result is left with an empty loan set.
+      bool KillSrc = true;
+      for (OriginID Src : ByLifetime.lookup(LV.getName())) {
+        CurrentBlockFacts.push_back(FactMgr.createFact<OriginFlowFact>(
+            ResultLevel->getOuterOriginID(), Src, KillSrc));
+        KillSrc = false;
+      }
+    }
+    ResultLevel = ResultLevel->peelOuterOrigin();
+  }
+  return true;
+}
+
 void FactsGenerator::handleFunctionCall(const Expr *Call,
                                         bool IsGslConstruction) {
   FunctionCallInfo CallInfo(Call);
@@ -1085,6 +1197,14 @@ void FactsGenerator::handleFunctionCall(const Expr *Call,
   handleMovedArgsInCall(FD, Args);
   handleImplicitObjectFieldUses(Call, FD);
   handleLifetimeCaptureBy(FD, Args);
+  // A named lifetime signature is strictly more precise than `lifetimebound`,
+  // so where one governs the result it wins outright and the union below is
+  // skipped entirely. See "Q5: signatures and lifetimebound".
+  //
+  // This runs before the bails below because the obligations a `$static`
+  // parameter imposes on its argument do not depend on the result: a `void`
+  // function has no result at all, and it still has to be checked.
+  bool SignatureGovernsResult = handleNamedLifetimeCall(FD, Args, CallList);
   if (!CallList)
     return;
   if (isStdReferenceCast(FD)) {
@@ -1105,6 +1225,8 @@ void FactsGenerator::handleFunctionCall(const Expr *Call,
                                         /*RunningUnderLifetimeSafety=*/true);
   };
   if (Args.empty())
+    return;
+  if (SignatureGovernsResult)
     return;
   bool KillSrc = true;
   for (unsigned I = 0; I < Args.size(); ++I) {
@@ -1210,20 +1332,55 @@ llvm::SmallVector<Fact *> FactsGenerator::issuePlaceholderLoans() {
     return {};
 
   llvm::SmallVector<Fact *> PlaceholderLoanFacts;
+  LifetimeSignature Sig = getLifetimeSignature(AC.getASTContext(), FD);
+
+  // Positions annotated with a named lifetime additionally borrow from that
+  // lifetime, so that a value derived from any `$a` position is
+  // indistinguishable from one derived from any other. The loan is additive:
+  // the position keeps its own placeholder loan, which is what `lifetimebound`
+  // verification and the "aliases the storage of" notes rely on.
+  //
+  // The lifetime list and the origin list are both ordered outermost-first, so
+  // they zip positionally. A list that is too long has already been diagnosed;
+  // stop at whichever runs out first.
+  auto issueNamedLoans = [&](const LifetimeList &Lifetimes, OriginList *List) {
+    for (const LifetimeVar &LV : Lifetimes) {
+      if (!List)
+        break;
+      if (LV.getKind() == LifetimeVar::Kind::Named) {
+        const Loan *NamedLoan =
+            FactMgr.getLoanMgr().getOrCreateNamedPlaceholderLoan(LV.getName());
+        PlaceholderLoanFacts.push_back(FactMgr.createFact<IssueFact>(
+            NamedLoan->getID(), List->getOuterOriginID(),
+            /*Additive=*/true));
+      }
+      List = List->peelOuterOrigin();
+    }
+  };
+
   if (auto ThisOrigins = FactMgr.getOriginMgr().getThisOrigins()) {
     OriginList *List = *ThisOrigins;
     const Loan *L =
         FactMgr.getLoanMgr().createPlaceholderLoan(cast<CXXMethodDecl>(FD));
     PlaceholderLoanFacts.push_back(
         FactMgr.createFact<IssueFact>(L->getID(), List->getOuterOriginID()));
+    // Lifetimes written after the parameter list belong to the implicit
+    // object parameter, which is the position `lifetimebound` uses for it.
+    issueNamedLoans(Sig.FunctionType, List);
   }
+
+  unsigned ParamIdx = 0;
   for (const ParmVarDecl *PVD : FD->parameters()) {
+    const unsigned Idx = ParamIdx++;
     OriginList *List = getOriginsList(*PVD);
     if (!List)
       continue;
     const Loan *L = FactMgr.getLoanMgr().createPlaceholderLoan(PVD);
     PlaceholderLoanFacts.push_back(
         FactMgr.createFact<IssueFact>(L->getID(), List->getOuterOriginID()));
+
+    if (Idx < Sig.Params.size())
+      issueNamedLoans(Sig.Params[Idx], List);
   }
   return PlaceholderLoanFacts;
 }

@@ -20,6 +20,7 @@
 #include "clang/Analysis/Analyses/LifetimeSafety/Utils.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace clang::lifetimes::internal {
@@ -70,32 +71,54 @@ private:
   const FieldDecl *FD;
 };
 
-/// Represents the base of a placeholder access path, which is either a
-/// function parameter or the implicit 'this' object of an instance method.
+/// A lifetime parameter named by an annotation, e.g. the `a` of `$a`.
+///
+/// Uniqued by the LoanManager so that every occurrence of `$a` in a signature
+/// denotes the same object, which is what lets parameters that share a
+/// lifetime share a loan.
+class NamedLifetime {
+  llvm::StringRef Name;
+
+public:
+  explicit NamedLifetime(llvm::StringRef Name) : Name(Name) {}
+
+  llvm::StringRef getName() const { return Name; }
+};
+
+/// Represents the base of a placeholder access path: a function parameter, the
+/// implicit 'this' object of an instance method, or a named lifetime.
 /// Placeholder paths never expire within the function scope, as they represent
 /// storage from the caller's scope.
 class PlaceholderBase : public llvm::FoldingSetNode {
-  llvm::PointerUnion<const ParmVarDecl *, const CXXMethodDecl *> ParamOrMethod;
+  llvm::PointerUnion<const ParmVarDecl *, const CXXMethodDecl *,
+                     const NamedLifetime *>
+      Base;
 
 public:
-  PlaceholderBase(const ParmVarDecl *PVD) : ParamOrMethod(PVD) {}
-  PlaceholderBase(const CXXMethodDecl *MD) : ParamOrMethod(MD) {}
+  PlaceholderBase(const ParmVarDecl *PVD) : Base(PVD) {}
+  PlaceholderBase(const CXXMethodDecl *MD) : Base(MD) {}
+  PlaceholderBase(const NamedLifetime *NL) : Base(NL) {}
 
   const ParmVarDecl *getParmVarDecl() const {
-    return ParamOrMethod.dyn_cast<const ParmVarDecl *>();
+    return Base.dyn_cast<const ParmVarDecl *>();
   }
 
   const CXXMethodDecl *getImplicitThisParent() const {
-    return ParamOrMethod.dyn_cast<const CXXMethodDecl *>();
+    return Base.dyn_cast<const CXXMethodDecl *>();
   }
 
-  using KeyTy = llvm::PointerUnion<const ParmVarDecl *, const CXXMethodDecl *>;
-
-  static void Profile(llvm::FoldingSetNodeID &ID, KeyTy ParamOrMethod) {
-    ID.AddPointer(ParamOrMethod.getOpaqueValue());
+  const NamedLifetime *getNamedLifetime() const {
+    return Base.dyn_cast<const NamedLifetime *>();
   }
 
-  void Profile(llvm::FoldingSetNodeID &ID) const { Profile(ID, ParamOrMethod); }
+  using KeyTy = llvm::PointerUnion<const ParmVarDecl *, const CXXMethodDecl *,
+                                   const NamedLifetime *>;
+
+  static void Profile(llvm::FoldingSetNodeID &ID, KeyTy Base) {
+    ID.AddPointer(Base.getOpaqueValue());
+  }
+
+  void Profile(llvm::FoldingSetNodeID &ID) const { Profile(ID, Base); }
 };
 
 /// Represents the storage location being borrowed, e.g., a specific stack
@@ -229,6 +252,18 @@ public:
   Loan *createPlaceholderLoan(const CXXMethodDecl *MD) {
     return createLoan(AccessPath(getOrCreatePlaceholderBase(MD)));
   }
+  /// Returns the loan standing for the caller's storage named \p Name.
+  ///
+  /// All positions annotated with the same lifetime share this one loan, so a
+  /// value derived from any of them is indistinguishable from a value derived
+  /// from the others, which is exactly what the annotation asserts.
+  Loan *getOrCreateNamedPlaceholderLoan(llvm::StringRef Name) {
+    Loan *&L = NamedLifetimeLoans[Name];
+    if (!L)
+      L = createLoan(AccessPath(
+          getOrCreatePlaceholderBase(getOrCreateNamedLifetime(Name))));
+    return L;
+  }
 
   const Loan *getLoan(LoanID ID) const {
     assert(ID.Value < AllLoans.size());
@@ -243,10 +278,27 @@ private:
   /// Gets or creates a placeholder base for a given parameter or method.
   const PlaceholderBase *getOrCreatePlaceholderBase(const ParmVarDecl *PVD);
   const PlaceholderBase *getOrCreatePlaceholderBase(const CXXMethodDecl *MD);
+  const PlaceholderBase *getOrCreatePlaceholderBase(const NamedLifetime *NL);
+
+  /// StringMap entries have stable addresses, so the returned pointer can be
+  /// used as the identity of the lifetime.
+  const NamedLifetime *getOrCreateNamedLifetime(llvm::StringRef Name) {
+    auto It = NamedLifetimes.find(Name);
+    if (It != NamedLifetimes.end())
+      return &It->second;
+    // Insert first so the map owns the characters, then point the
+    // NamedLifetime at the map's copy rather than the caller's buffer.
+    auto [Entry, Inserted] =
+        NamedLifetimes.try_emplace(Name, NamedLifetime(llvm::StringRef()));
+    Entry->second = NamedLifetime(Entry->getKey());
+    return &Entry->second;
+  }
 
   LoanID NextLoanID{0};
 
   llvm::FoldingSet<PlaceholderBase> PlaceholderBases;
+  llvm::StringMap<NamedLifetime> NamedLifetimes;
+  llvm::StringMap<Loan *> NamedLifetimeLoans;
 
   /// TODO(opt): Profile and evaluate the usefullness of small buffer
   /// optimisation.

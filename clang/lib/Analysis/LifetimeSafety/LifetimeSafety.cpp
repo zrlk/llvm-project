@@ -18,10 +18,12 @@
 #include "clang/Analysis/Analyses/LifetimeSafety/Checker.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/Facts.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/FactsGenerator.h"
+#include "clang/Analysis/Analyses/LifetimeSafety/LifetimeAnnotations.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LifetimeStats.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LiveOrigins.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LoanPropagation.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/Origins.h"
+#include "clang/Analysis/Analyses/LifetimeSafety/SignatureCheck.h"
 #include "clang/Analysis/AnalysisDeclContext.h"
 #include "clang/Analysis/CFG.h"
 #include "llvm/Support/Debug.h"
@@ -46,6 +48,17 @@ static void DebugOnlyFunction(AnalysisDeclContext &AC, const CFG &Cfg,
                                          /*ShowColors=*/true));
   DEBUG_WITH_TYPE(Name.c_str(), FactMgr.dump(Cfg, AC, LPA));
 }
+
+/// Dumps the named lifetime annotations written on the function under
+/// analysis. Used to cross-check the elaborated signature against Crubit.
+static void DumpLifetimeSignature(AnalysisDeclContext &AC) {
+  const auto *FD = dyn_cast_if_present<FunctionDecl>(AC.getDecl());
+  if (!FD)
+    return;
+  LifetimeSignature Sig = getLifetimeSignature(AC.getASTContext(), FD);
+  if (!Sig.empty())
+    Sig.dump(llvm::dbgs(), FD);
+}
 #endif
 
 LifetimeSafetyAnalysis::LifetimeSafetyAnalysis(
@@ -55,6 +68,16 @@ LifetimeSafetyAnalysis::LifetimeSafetyAnalysis(
 
 void LifetimeSafetyAnalysis::run() {
   llvm::TimeTraceScope TimeProfile("LifetimeSafetyAnalysis");
+
+  // Dumped before the CFG-size bailout below, since it does not depend on the
+  // CFG.
+  DEBUG_WITH_TYPE("LifetimeSignatures", DumpLifetimeSignature(AC));
+
+  // Likewise a property of the declaration alone, so it is checked even for
+  // functions whose CFG is too large to analyze.
+  if (LSOpts.CheckNamedLifetimes || LSOpts.CheckLifetimeboundConflict ||
+      LSOpts.SuggestNamedLifetimebound)
+    checkNamedLifetimes(AC, SemaHelper, LSOpts);
 
   const CFG &Cfg = *AC.getCFG();
   if (LSOpts.MaxCFGBlocks > 0 && Cfg.getNumBlockIDs() > LSOpts.MaxCFGBlocks) {

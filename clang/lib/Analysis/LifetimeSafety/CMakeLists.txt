@@ -10,6 +10,7 @@ add_clang_library(clangAnalysisLifetimeSafety
   LoanPropagation.cpp
   MovedLoans.cpp
   Origins.cpp
+  SignatureCheck.cpp
 
   LINK_LIBS
   clangAST

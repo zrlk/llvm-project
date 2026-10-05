@@ -118,6 +118,20 @@ private:
   ///   argument origins should flow to the returned origin.
   void handleFunctionCall(const Expr *Call, bool IsGslConstruction = false);
 
+  /// Flows argument origins into the call result by matching named lifetimes,
+  /// rather than by the `[[clang::lifetimebound]]` union.
+  ///
+  /// For a callee whose return type names a lifetime, the result borrows from
+  /// exactly those arguments written with the same lifetime. This is strictly
+  /// more precise than `lifetimebound`, which can only say "the result may
+  /// borrow from some annotated argument" without distinguishing which.
+  ///
+  /// \returns True if the signature governed this call and the caller should
+  ///   skip the `lifetimebound` path entirely.
+  bool handleNamedLifetimeCall(const FunctionDecl *FD,
+                               ArrayRef<const Expr *> Args,
+                               OriginList *CallList);
+
   // Detect methods that invalidate iterators/references/pointees.
   // For instance methods, Args[0] is the implicit 'this' pointer.
   void handleInvalidatingCall(const Expr *Call, const FunctionDecl *FD,

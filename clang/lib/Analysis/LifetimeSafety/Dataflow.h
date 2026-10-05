@@ -185,6 +185,8 @@ private:
       return D->transfer(In, *F->getAs<InvalidateOriginFact>());
     case Fact::Kind::KillOrigin:
       return D->transfer(In, *F->getAs<KillOriginFact>());
+    case Fact::Kind::StaticObligation:
+      return D->transfer(In, *F->getAs<StaticObligationFact>());
     }
     llvm_unreachable("Unknown fact kind");
   }
@@ -201,6 +203,7 @@ public:
   Lattice transfer(Lattice In, const TestPointFact &) { return In; }
   Lattice transfer(Lattice In, const InvalidateOriginFact &) { return In; }
   Lattice transfer(Lattice In, const KillOriginFact &) { return In; }
+  Lattice transfer(Lattice In, const StaticObligationFact &) { return In; }
 };
 } // namespace clang::lifetimes::internal
 #endif // LLVM_CLANG_ANALYSIS_ANALYSES_LIFETIMESAFETY_DATAFLOW_H

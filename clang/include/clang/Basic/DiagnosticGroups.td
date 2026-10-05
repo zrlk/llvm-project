@@ -702,10 +702,22 @@ def LifetimeSafetyCrossTUSuggestions
 def LifetimeSafetyIntraTUSuggestions
     : DiagGroup<"lifetime-safety-intra-tu-suggestions",
                 [LifetimeSafetyIntraTUConstructorSuggestions]>;
+def LifetimeSafetyNamedLifetimeSuggestions
+    : DiagGroup<"lifetime-safety-named-lifetime-suggestions"> {
+  code Documentation = [{
+Suggests adding [[clang::lifetimebound]] to a parameter whose named lifetime
+matches the one declared by the return type. Such a parameter is already
+understood by the lifetime signature, but tools that only read
+[[clang::lifetimebound]] -- including Clang's own -Wdangling -- cannot see the
+relationship without the attribute.
+  }];
+}
+
 def LifetimeSafetySuggestions
     : DiagGroup<"lifetime-safety-suggestions",
                 [LifetimeSafetyCrossTUSuggestions,
-                 LifetimeSafetyIntraTUSuggestions]> {
+                 LifetimeSafetyIntraTUSuggestions,
+                 LifetimeSafetyNamedLifetimeSuggestions]> {
   code Documentation = [{
 Lifetime annotation suggestions for function parameters that should be marked [[clang::lifetimebound]] based on lifetime analysis.
   }];
@@ -718,19 +730,64 @@ Detects misuse of [[clang::noescape]] annotation where the parameter escapes (fo
   }];
 }
 
+def LifetimeSafetyUndeclaredLifetime
+    : DiagGroup<"lifetime-safety-undeclared-lifetime"> {
+  code Documentation = [{
+Reports a named lifetime that is used but never introduced by
+`LIFETIME_PARAMS`. Unlike the other named-lifetime checks, an undeclared
+lifetime is still meaningful -- it denotes a fresh lifetime parameter, which is
+how Crubit reads it. This check exists to catch the case where two positions
+were meant to share a lifetime and a typo left them independent, so it is
+separable from the checks that report annotations which cannot mean anything.
+  }];
+}
+
+def LifetimeSafetyNamedLifetimes
+    : DiagGroup<"lifetime-safety-named-lifetimes",
+                [LifetimeSafetyUndeclaredLifetime]> {
+  code Documentation = [{
+Validates that named lifetime annotations, spelled `$a` via
+`[[clang::annotate_type("lifetime", "a")]]` and introduced by
+`LIFETIME_PARAMS`, are well formed: that they are written on types that can
+carry a lifetime, that the right number of them is written, and that every
+lifetime used is declared.
+  }];
+}
+
+def LifetimeSafetyLifetimeboundConflict
+    : DiagGroup<"lifetime-safety-lifetimebound-conflict"> {
+  code Documentation = [{
+Detects a parameter that is marked [[clang::lifetimebound]] -- asserting that
+the result may borrow from it -- while its named lifetime differs from the
+lifetime declared by the return type. The two annotations describe
+contradictory contracts.
+  }];
+}
+
 def LifetimeSafetyAnnotationPlacement
     : DiagGroup<"lifetime-safety-annotation-placement",
                 [LifetimeSafetyInapplicableLifetimebound,
-                 LifetimeSafetyMisplacedLifetimebound]> {
+                 LifetimeSafetyMisplacedLifetimebound,
+                 LifetimeSafetyNamedLifetimes,
+                 LifetimeSafetyLifetimeboundConflict]> {
   code Documentation = [{
 Validates that lifetime annotations are placed on appropriate types and in appropriate locations.
+  }];
+}
+
+def LifetimeSafetyNamedLifetimeViolation
+    : DiagGroup<"lifetime-safety-named-lifetime-violation"> {
+  code Documentation = [{
+Detects a function whose body returns a value borrowed from a different named
+lifetime than the one its return type declares.
   }];
 }
 
 def LifetimeSafetyAnnotationVerification
     : DiagGroup<"lifetime-safety-annotation-verification",
                 [LifetimeSafetyNoescape,
-                 LifetimeSafetyLifetimeboundViolation]> {
+                 LifetimeSafetyLifetimeboundViolation,
+                 LifetimeSafetyNamedLifetimeViolation]> {
   code Documentation = [{
 Verifies that function implementations adhere to their lifetime annotation contracts through dataflow analysis.
   }];

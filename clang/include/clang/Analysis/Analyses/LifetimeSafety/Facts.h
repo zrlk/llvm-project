@@ -63,6 +63,9 @@ public:
     InvalidateOrigin,
     /// All loans of an origin are cleared.
     KillOrigin,
+    /// An origin is passed to a parameter that declares the `$static`
+    /// lifetime, obliging its storage to live forever.
+    StaticObligation,
   };
 
 private:
@@ -100,13 +103,28 @@ using ProgramPoint = const Fact *;
 class IssueFact : public Fact {
   LoanID LID;
   OriginID OID;
+  bool Additive;
 
 public:
   static bool classof(const Fact *F) { return F->getKind() == Kind::Issue; }
 
-  IssueFact(LoanID LID, OriginID OID) : Fact(Kind::Issue), LID(LID), OID(OID) {}
+  /// \param Additive whether the loan joins the origin's existing loans
+  /// rather than replacing them. A borrow expression replaces, since the
+  /// origin now refers to the new referent. The placeholder loans issued at
+  /// function entry accumulate, because a single annotated position is
+  /// borrowed from under more than one identity at once: its own placeholder
+  /// and each named lifetime it declares.
+  ///
+  /// Replacing in that second case loses the position's own placeholder loan,
+  /// which is what `lifetimebound` verification searches the escaped set for.
+  /// `int* $a f(int* $a p [[clang::lifetimebound]])` then reports that it
+  /// "could not verify" an escape that is in fact correct. Only named
+  /// lifetimes pass `Additive`, so nothing changes unless they are in use.
+  IssueFact(LoanID LID, OriginID OID, bool Additive = false)
+      : Fact(Kind::Issue), LID(LID), OID(OID), Additive(Additive) {}
   LoanID getLoanID() const { return LID; }
   OriginID getOriginID() const { return OID; }
+  bool isAdditive() const { return Additive; }
   void dump(llvm::raw_ostream &OS, const LoanManager &LM,
             const OriginManager &OM,
             const LoanPropagationAnalysis *LPA = nullptr) const override;
@@ -239,6 +257,39 @@ public:
                EscapeKind::Global;
   }
   const VarDecl *getGlobal() const { return Global; };
+  void dump(llvm::raw_ostream &OS, const LoanManager &, const OriginManager &OM,
+            const LoanPropagationAnalysis *LPA = nullptr) const override;
+};
+
+/// Represents an argument passed to a parameter that declares the `$static`
+/// lifetime, which the argument's storage must satisfy.
+///
+/// This is deliberately not an `OriginEscapesFact`. An escape says the origin
+/// outlives the function and therefore has to stay live to the end of the
+/// analysis; a `$static` parameter instead imposes an obligation that is
+/// decided entirely at the call, from the loans the argument holds there.
+class StaticObligationFact : public Fact {
+  OriginID OID;
+  const Expr *ArgExpr;
+  const ParmVarDecl *Param;
+
+public:
+  static bool classof(const Fact *F) {
+    return F->getKind() == Kind::StaticObligation;
+  }
+
+  StaticObligationFact(OriginID OID, const Expr *ArgExpr,
+                       const ParmVarDecl *Param)
+      : Fact(Kind::StaticObligation), OID(OID), ArgExpr(ArgExpr), Param(Param) {
+  }
+
+  OriginID getOriginID() const { return OID; }
+  const Expr *getArgExpr() const { return ArgExpr; }
+
+  /// Null when the obligation falls on the implicit object argument, whose
+  /// lifetime is written after the parameter list.
+  const ParmVarDecl *getParam() const { return Param; }
+
   void dump(llvm::raw_ostream &OS, const LoanManager &, const OriginManager &OM,
             const LoanPropagationAnalysis *LPA = nullptr) const override;
 };

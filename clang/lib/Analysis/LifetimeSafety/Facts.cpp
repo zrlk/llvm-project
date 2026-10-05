@@ -58,6 +58,12 @@ void FactManager::computePersistentOrigins(const CFG &Cfg) {
         // it spans blocks and must participate in joins.
         CheckOrigin(F->getAs<OriginEscapesFact>()->getEscapedOriginID());
         break;
+      case Fact::Kind::StaticObligation:
+        // Likewise: the obligation is decided by reading the argument's loans
+        // at the call, which may be several blocks from where they were
+        // issued.
+        CheckOrigin(F->getAs<StaticObligationFact>()->getOriginID());
+        break;
       // `Expire` and `InvalidateOrigin` only ever clear an origin, so
       // misclassifying one is harmless: the clear becomes a no-op.
       case Fact::Kind::MovedOrigin:
@@ -82,6 +88,8 @@ void IssueFact::dump(llvm::raw_ostream &OS, const LoanManager &LM,
   LM.getLoan(getLoanID())->dump(OS);
   OS << ", ToOrigin: ";
   OM.dump(getOriginID(), OS);
+  if (isAdditive())
+    OS << ", Additive";
   OS << ")\n";
 }
 
@@ -153,6 +161,18 @@ void GlobalEscapeFact::dump(llvm::raw_ostream &OS, const LoanManager &,
   OS << "OriginEscapes (";
   OM.dump(getEscapedOriginID(), OS);
   OS << ", via Global)\n";
+}
+
+void StaticObligationFact::dump(llvm::raw_ostream &OS, const LoanManager &,
+                                const OriginManager &OM,
+                                const LoanPropagationAnalysis *) const {
+  OS << "StaticObligation (";
+  OM.dump(getOriginID(), OS);
+  if (const ParmVarDecl *PVD = getParam())
+    OS << ", " << PVD->getNameAsString();
+  else
+    OS << ", this";
+  OS << ")\n";
 }
 
 void UseFact::dump(llvm::raw_ostream &OS, const LoanManager &,

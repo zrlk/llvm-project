@@ -17,6 +17,7 @@
 #include "clang/AST/TypeLoc.h"
 #include "clang/Analysis/AnyCall.h"
 #include "clang/Basic/OperatorKinds.h"
+#include "clang/Basic/SourceManager.h"
 #include "llvm/ADT/StringSet.h"
 
 namespace clang::lifetimes {
@@ -548,6 +549,378 @@ bool isStdReferenceCast(const FunctionDecl *FD) {
   default:
     return false;
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Named lifetimes
+//===----------------------------------------------------------------------===//
+
+LifetimeVar::LifetimeVar(llvm::StringRef Name) : Name(Name) {
+  if (Name == "static")
+    K = Kind::Static;
+  else if (Name == "unknown")
+    K = Kind::Unknown;
+  else
+    K = Kind::Named;
+}
+
+void LifetimeVar::dump(llvm::raw_ostream &OS) const {
+  if (isElided()) {
+    OS << "<elided>";
+    return;
+  }
+  OS << "$" << Name;
+}
+
+namespace {
+
+/// Extracts the value of a string-literal attribute argument.
+///
+/// Sema constant-folds `annotate`/`annotate_type` arguments and applies
+/// array-to-pointer decay, so a `"a"` argument arrives here as an LValue whose
+/// base is the StringLiteral rather than as a string.
+std::optional<llvm::StringRef> evaluateAsStringLiteral(const ASTContext &Ctx,
+                                                       const Expr *E) {
+  if (!E || E->isValueDependent() || E->isTypeDependent())
+    return std::nullopt;
+  Expr::EvalResult Eval;
+  if (!E->EvaluateAsConstantExpr(Eval, Ctx) || !Eval.Val.isLValue())
+    return std::nullopt;
+  const auto *Base = Eval.Val.getLValueBase().dyn_cast<const Expr *>();
+  const auto *SL = dyn_cast_or_null<StringLiteral>(Base);
+  if (!SL)
+    return std::nullopt;
+  return SL->getString();
+}
+
+/// Appends the lifetimes named by a single `annotate_type("lifetime", ...)`.
+///
+/// Arguments are appended in reverse so that the single reversal performed by
+/// getExplicitLifetimesAtLevel restores source order for both spellings
+/// (`$(a) $(b)` and a hypothetical `$(a, b)`).
+void appendLifetimesReversed(const ASTContext &Ctx,
+                             const AnnotateTypeAttr *Attr, LifetimeList &Out) {
+  for (const Expr *Arg : llvm::reverse(Attr->args()))
+    if (std::optional<llvm::StringRef> Name = evaluateAsStringLiteral(Ctx, Arg))
+      Out.push_back(LifetimeVar(*Name));
+}
+
+} // namespace
+
+QualType getExplicitLifetimesAtLevel(const ASTContext &Ctx, QualType QT,
+                                     LifetimeList &Out) {
+  const size_t FirstNew = Out.size();
+  while (const Type *T = QT.getTypePtrOrNull()) {
+    // Every macro-spelled attribute is wrapped in a MacroQualifiedType; missing
+    // this would hide all annotations written through the `$` macros.
+    if (const auto *MQT = dyn_cast<MacroQualifiedType>(T)) {
+      QT = MQT->getUnderlyingType();
+      continue;
+    }
+    // Deliberately dyn_cast rather than Type::getAs<>(): getAs<>() looks
+    // through all sugar and would skip past the level being inspected.
+    if (const auto *AT = dyn_cast<AttributedType>(T)) {
+      if (const auto *ATA = dyn_cast_or_null<AnnotateTypeAttr>(AT->getAttr()))
+        if (ATA->getAnnotation() == LifetimeAnnotationCategory)
+          appendLifetimesReversed(Ctx, ATA, Out);
+      QT = AT->getModifiedType();
+      continue;
+    }
+    break;
+  }
+  // Attributes nest with the last-written one outermost, so reverse the
+  // lifetimes found at this level to recover source order.
+  std::reverse(Out.begin() + FirstNew, Out.end());
+  return QT;
+}
+
+unsigned getLifetimeSlotsAtLevel(const ASTContext &Ctx, QualType QT) {
+  if (QT.isNull())
+    return 0;
+  if (QT->isPointerOrReferenceType())
+    return 1;
+  // A class type carries exactly the lifetimes its definition declares.
+  // Nothing is inferred from its members.
+  if (const auto *RD = QT->getAsCXXRecordDecl())
+    if (const CXXRecordDecl *Def = RD->getDefinition())
+      return getDeclaredLifetimeParams(Ctx, Def).size();
+  return 0;
+}
+
+LifetimeList getExplicitLifetimes(const ASTContext &Ctx, QualType QT) {
+  LifetimeList Result;
+  // Mirror the levels built by OriginManager::buildListForType so that the
+  // result can be zipped against an OriginList.
+  while (!QT.isNull()) {
+    const size_t LevelStart = Result.size();
+    // Collect everything written at this level. `_Atomic(T)` is transparent
+    // for lifetime purposes, so it does not begin a level of its own and any
+    // annotations on either side of it belong together.
+    for (;;) {
+      QT = getExplicitLifetimesAtLevel(Ctx, QT, Result);
+      const auto *AT = QT.isNull() ? nullptr : QT->getAs<AtomicType>();
+      if (!AT)
+        break;
+      QT = AT->getValueType();
+    }
+    if (QT.isNull())
+      break;
+
+    // Each level is annotated independently, so a level with nothing written
+    // on it still occupies its slots, and a level with too much written on it
+    // does not spill onto the next. Normalising every level to exactly its own
+    // size keeps the levels that follow aligned with their origins; without it
+    // an annotation on an inner level would be attributed to an outer one, and
+    // the ill-formed `int **$a $b` would silently acquire the meaning of the
+    // well-formed `int *$a *$b`. The excess is diagnosed in SignatureCheck.
+    Result.resize(LevelStart + getLifetimeSlotsAtLevel(Ctx, QT),
+                  LifetimeVar::elided());
+
+    if (!QT->isPointerOrReferenceType())
+      break;
+    QT = QT->getPointeeType();
+  }
+  // Trailing holes say nothing that the list's length does not already say.
+  // Dropping them keeps a type with no annotations at all elaborating to the
+  // empty list.
+  while (!Result.empty() && Result.back().isElided())
+    Result.pop_back();
+  return Result;
+}
+
+LifetimeList getDeclaredLifetimeParams(const ASTContext &Ctx, const Decl *D) {
+  LifetimeList Result;
+  if (!D)
+    return Result;
+  for (const auto *Attr : D->specific_attrs<AnnotateAttr>()) {
+    if (Attr->getAnnotation() != LifetimeParamsAnnotationCategory)
+      continue;
+    for (const Expr *Arg : Attr->args())
+      if (std::optional<llvm::StringRef> Name =
+              evaluateAsStringLiteral(Ctx, Arg))
+        Result.push_back(LifetimeVar(*Name));
+  }
+  return Result;
+}
+
+bool LifetimeSignature::empty() const {
+  if (!Declared.empty() || !FunctionType.empty() || !Return.empty())
+    return false;
+  return llvm::all_of(Params, [](const LifetimeList &L) { return L.empty(); });
+}
+
+void LifetimeSignature::dump(llvm::raw_ostream &OS,
+                             const FunctionDecl *FD) const {
+  auto PrintList = [&OS](llvm::StringRef Label, const LifetimeList &L) {
+    OS << "  " << Label << ": ";
+    if (L.empty()) {
+      OS << "<none>\n";
+      return;
+    }
+    for (size_t I = 0; I < L.size(); ++I) {
+      if (I)
+        OS << ", ";
+      L[I].dump(OS);
+    }
+    OS << "\n";
+  };
+
+  OS << "Lifetime signature for "
+     << (FD ? FD->getQualifiedNameAsString() : "<null>") << ":\n";
+  PrintList("declared", Declared);
+  PrintList("function-type", FunctionType);
+  PrintList("return", Return);
+  for (size_t I = 0; I < Params.size(); ++I) {
+    std::string Label = "param " + std::to_string(I);
+    if (FD && I < FD->getNumParams())
+      if (const IdentifierInfo *II = FD->getParamDecl(I)->getIdentifier())
+        Label += " ('" + II->getName().str() + "')";
+    PrintList(Label, Params[I]);
+  }
+}
+
+/// Reads the signature spelled on one particular declaration of a function.
+LifetimeSignature getDirectLifetimeSignature(const ASTContext &Ctx,
+                                             const FunctionDecl *FD) {
+  LifetimeSignature Sig;
+  // An attribute written after the parameter list wraps the whole function
+  // type; peeling it here also exposes the FunctionProtoType underneath.
+  getExplicitLifetimesAtLevel(Ctx, FD->getType(), Sig.FunctionType);
+  Sig.Return = getExplicitLifetimes(Ctx, FD->getReturnType());
+  Sig.Params.reserve(FD->getNumParams());
+  for (const ParmVarDecl *PVD : FD->parameters())
+    Sig.Params.push_back(getExplicitLifetimes(Ctx, PVD->getType()));
+  return Sig;
+}
+
+LifetimeSignature getLifetimeSignature(const ASTContext &Ctx,
+                                       const FunctionDecl *FD) {
+  LifetimeSignature Sig;
+  if (!FD)
+    return Sig;
+
+  // `annotate` is an inheritable declaration attribute, so it is visible on any
+  // redeclaration.
+  Sig.Declared = getDeclaredLifetimeParams(Ctx, FD);
+
+  // Attributes on types do not merge across redeclarations, so the annotations
+  // are only visible on the declaration that spelled them.
+  auto ScanRedecls =
+      [&](const FunctionDecl *F) -> std::optional<LifetimeSignature> {
+    for (const FunctionDecl *Redecl : F->redecls()) {
+      LifetimeSignature Candidate = getDirectLifetimeSignature(Ctx, Redecl);
+      if (!Candidate.empty())
+        return Candidate;
+    }
+    return std::nullopt;
+  };
+
+  // TODO: Diagnose conflicting signatures across redeclarations rather than
+  // taking the first one that carries annotations.
+  std::optional<LifetimeSignature> Found = ScanRedecls(FD);
+  if (!Found)
+    if (const FunctionDecl *Pattern = FD->getTemplateInstantiationPattern())
+      Found = ScanRedecls(Pattern);
+
+  if (Found) {
+    Sig.FunctionType = std::move(Found->FunctionType);
+    Sig.Return = std::move(Found->Return);
+    Sig.Params = std::move(Found->Params);
+  } else {
+    Sig.Params.resize(FD->getNumParams());
+  }
+  return Sig;
+}
+
+bool haveSameWrittenLifetimes(const LifetimeSignature &A,
+                              const LifetimeSignature &B) {
+  return A.FunctionType == B.FunctionType && A.Return == B.Return &&
+         A.Params == B.Params;
+}
+
+//===----------------------------------------------------------------------===//
+// Locations
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Collects the lifetimes written at the outermost level of \p TL.
+///
+/// This mirrors getExplicitLifetimesAtLevel, but over TypeLoc, which is the
+/// only representation that records where each individual annotation was
+/// written. Returns the TypeLoc with this level's annotation sugar removed.
+TypeLoc collectUsesAtLevel(const ASTContext &Ctx, TypeLoc TL,
+                           LifetimeUseList &Out,
+                           SourceLocation &NonLiteralArgLoc) {
+  const size_t FirstNew = Out.size();
+  // The innermost enclosing macro expansion, which is where the user actually
+  // wrote `$a`. The attribute's own location points into the macro definition.
+  SourceLocation MacroLoc;
+  while (TL) {
+    if (auto MQL = TL.getAs<MacroQualifiedTypeLoc>()) {
+      MacroLoc = MQL.getExpansionLoc();
+      TL = MQL.getInnerLoc();
+      continue;
+    }
+    if (auto ATL = TL.getAs<AttributedTypeLoc>()) {
+      const auto *ATA = dyn_cast_or_null<AnnotateTypeAttr>(ATL.getAttr());
+      if (ATA && ATA->getAnnotation() == LifetimeAnnotationCategory) {
+        SourceLocation Loc = MacroLoc.isValid()
+                                 ? MacroLoc
+                                 : ATL.getLocalSourceRange().getBegin();
+        // Arguments are appended in reverse so that the single reversal below
+        // restores source order; see appendLifetimesReversed.
+        for (const Expr *Arg : llvm::reverse(ATA->args())) {
+          std::optional<llvm::StringRef> Name =
+              evaluateAsStringLiteral(Ctx, Arg);
+          if (!Name) {
+            if (NonLiteralArgLoc.isInvalid())
+              NonLiteralArgLoc = Loc;
+            continue;
+          }
+          Out.push_back({LifetimeVar(*Name), Loc});
+        }
+      }
+      MacroLoc = SourceLocation();
+      TL = ATL.getModifiedLoc();
+      continue;
+    }
+    break;
+  }
+  // Attributes nest with the last-written one outermost.
+  std::reverse(Out.begin() + FirstNew, Out.end());
+  return TL;
+}
+
+} // namespace
+
+WrittenLifetimes getWrittenLifetimes(const ASTContext &Ctx, TypeLoc TL) {
+  WrittenLifetimes Result;
+  while (TL) {
+    WrittenLifetimeLevel Level;
+    // `_Atomic(T)` and parentheses are transparent for lifetime purposes:
+    // neither begins a level of its own, so annotations written on either side
+    // of one belong together. This mirrors getExplicitLifetimes, which must
+    // agree with this walk on which annotations belong to which level.
+    for (;;) {
+      TL = collectUsesAtLevel(Ctx, TL, Level.Uses, Result.NonLiteralArgLoc);
+      if (!TL)
+        break;
+      if (auto ATL = TL.getAs<AtomicTypeLoc>()) {
+        TL = ATL.getValueLoc();
+        continue;
+      }
+      if (auto PTL = TL.getAs<ParenTypeLoc>()) {
+        TL = PTL.getInnerLoc();
+        continue;
+      }
+      break;
+    }
+    if (!TL)
+      break;
+
+    Level.Type = TL.getType();
+    Result.Levels.push_back(std::move(Level));
+
+    if (auto PTL = TL.getAs<PointerTypeLoc>()) {
+      TL = PTL.getPointeeLoc();
+      continue;
+    }
+    if (auto RTL = TL.getAs<ReferenceTypeLoc>()) {
+      TL = RTL.getPointeeLoc();
+      continue;
+    }
+    break;
+  }
+  return Result;
+}
+
+DeclaredLifetimes getDeclaredLifetimes(const ASTContext &Ctx, const Decl *D) {
+  DeclaredLifetimes Result;
+  if (!D)
+    return Result;
+  const SourceManager &SM = Ctx.getSourceManager();
+  for (const auto *Attr : D->specific_attrs<AnnotateAttr>()) {
+    if (Attr->getAnnotation() != LifetimeParamsAnnotationCategory)
+      continue;
+    // The attribute itself is spelled inside the LIFETIME_PARAMS macro, so its
+    // own location points at the macro definition.
+    Result.AttrLocs.push_back(SM.getFileLoc(Attr->getLocation()));
+    for (const Expr *Arg : Attr->args()) {
+      // Unlike the `$a` type annotations, these arguments are written by the
+      // user at the use site. getFileLoc recovers that spelling location,
+      // where getExpansionLoc would collapse them all onto the macro name.
+      SourceLocation Loc = SM.getFileLoc(Arg->getExprLoc());
+      std::optional<llvm::StringRef> Name = evaluateAsStringLiteral(Ctx, Arg);
+      if (!Name) {
+        if (Result.NonLiteralArgLoc.isInvalid())
+          Result.NonLiteralArgLoc = Loc;
+        continue;
+      }
+      Result.Params.push_back({LifetimeVar(*Name), Loc});
+    }
+  }
+  return Result;
 }
 
 } // namespace clang::lifetimes

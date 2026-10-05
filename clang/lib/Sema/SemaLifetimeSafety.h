@@ -72,6 +72,38 @@ inline bool ShouldCheckInapplicableLifetimebound(Sema &S, const Decl *D) {
       diag::warn_lifetime_safety_inapplicable_lifetimebound, D->getBeginLoc());
 }
 
+inline bool ShouldCheckNamedLifetimes(Sema &S, const Decl *D) {
+  DiagnosticsEngine &Diags = S.getDiagnostics();
+  constexpr unsigned DiagIDs[] = {
+      diag::warn_lifetime_safety_lifetime_arity_mismatch,
+      diag::warn_lifetime_safety_undeclared_lifetime,
+      diag::warn_lifetime_safety_lifetime_on_function_type,
+      diag::warn_lifetime_safety_duplicate_lifetime_param,
+      diag::warn_lifetime_safety_repeated_lifetime_params,
+      diag::warn_lifetime_safety_non_literal_lifetime,
+      diag::warn_lifetime_safety_conflicting_lifetime_signature};
+  for (unsigned DiagID : DiagIDs)
+    if (!Diags.isIgnored(DiagID, D->getBeginLoc()))
+      return true;
+  return false;
+}
+
+inline bool ShouldCheckNamedLifetimeViolations(Sema &S, const Decl *D) {
+  return !S.getDiagnostics().isIgnored(
+      diag::warn_lifetime_safety_named_lifetime_violation, D->getBeginLoc());
+}
+
+inline bool ShouldCheckLifetimeboundConflict(Sema &S, const Decl *D) {
+  return !S.getDiagnostics().isIgnored(
+      diag::warn_lifetime_safety_lifetimebound_lifetime_conflict,
+      D->getBeginLoc());
+}
+
+inline bool ShouldSuggestNamedLifetimebound(Sema &S, const Decl *D) {
+  return !S.getDiagnostics().isIgnored(
+      diag::warn_lifetime_safety_missing_lifetimebound, D->getBeginLoc());
+}
+
 inline bool ShouldSuggestLifetimeAnnotations(Sema &S, const Decl *D) {
   DiagnosticsEngine &Diags = S.getDiagnostics();
   constexpr unsigned DiagIDs[] = {
@@ -114,6 +146,10 @@ inline bool IsLifetimeSafetyEnabled(Sema &S, const Decl *D) {
          ShouldCheckLifetimeboundViolations(S, D) ||
          ShouldCheckMisplacedLifetimebound(S, D) ||
          ShouldCheckInapplicableLifetimebound(S, D) ||
+         ShouldCheckNamedLifetimes(S, D) ||
+         ShouldCheckNamedLifetimeViolations(S, D) ||
+         ShouldCheckLifetimeboundConflict(S, D) ||
+         ShouldSuggestNamedLifetimebound(S, D) ||
          ShouldSuggestLifetimeAnnotations(S, D);
 }
 
@@ -127,6 +163,11 @@ inline LifetimeSafetyOpts GetLifetimeSafetyOpts(Sema &S, const Decl *D) {
   LSOpts.CheckMisplacedLifetimebound = ShouldCheckMisplacedLifetimebound(S, D);
   LSOpts.CheckInapplicableLifetimebound =
       ShouldCheckInapplicableLifetimebound(S, D);
+  LSOpts.CheckNamedLifetimes = ShouldCheckNamedLifetimes(S, D);
+  LSOpts.CheckNamedLifetimeViolations =
+      ShouldCheckNamedLifetimeViolations(S, D);
+  LSOpts.CheckLifetimeboundConflict = ShouldCheckLifetimeboundConflict(S, D);
+  LSOpts.SuggestNamedLifetimebound = ShouldSuggestNamedLifetimebound(S, D);
   return LSOpts;
 }
 
@@ -434,6 +475,145 @@ public:
     S.Diag(Attr->getLocation(),
            diag::warn_lifetime_safety_inapplicable_lifetimebound)
         << PVD->getType() << Attr->getRange();
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Named lifetimes
+  //===--------------------------------------------------------------------===//
+
+  void reportLifetimeArityMismatch(SourceLocation Loc, QualType T,
+                                   unsigned Found, unsigned Expected) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_lifetime_arity_mismatch)
+        << T << Expected << Found;
+  }
+
+  void reportUndeclaredLifetime(SourceLocation Loc,
+                                llvm::StringRef Name) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_undeclared_lifetime) << Name;
+  }
+
+  void reportLifetimeOnFunctionType(SourceLocation Loc) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_lifetime_on_function_type);
+  }
+
+  void reportDuplicateLifetimeParam(SourceLocation Loc, SourceLocation PrevLoc,
+                                    llvm::StringRef Name) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_duplicate_lifetime_param) << Name;
+    S.Diag(PrevLoc, diag::note_lifetime_safety_lifetime_declared_here) << Name;
+  }
+
+  void reportRepeatedLifetimeParams(SourceLocation Loc,
+                                    SourceLocation PrevLoc) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_repeated_lifetime_params);
+    S.Diag(PrevLoc, diag::note_lifetime_safety_previous_lifetime_params);
+  }
+
+  void reportNonLiteralLifetimeArgument(SourceLocation Loc) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_non_literal_lifetime);
+  }
+
+  void reportConflictingLifetimeSignature(const FunctionDecl *FDef,
+                                          const FunctionDecl *FDecl) override {
+    S.Diag(FDef->getLocation(),
+           diag::warn_lifetime_safety_conflicting_lifetime_signature);
+    S.Diag(FDecl->getLocation(),
+           diag::note_lifetime_safety_previous_lifetime_signature);
+  }
+
+  void reportReservedLifetimeParam(SourceLocation Loc,
+                                   llvm::StringRef Name) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_reserved_lifetime_param) << Name;
+  }
+
+  void reportNamedLifetimeViolation(const Expr *EscapeExpr,
+                                    llvm::StringRef Found,
+                                    llvm::StringRef Required) override {
+    S.Diag(EscapeExpr->getExprLoc(),
+           diag::warn_lifetime_safety_named_lifetime_violation)
+        << Found << Required << EscapeExpr->getSourceRange();
+    // An outlives bound `Found: Required` is exactly what would make this
+    // well-typed. There is no syntax for one, so the note only explains the
+    // rejection -- it never causes anything to be accepted, and so carries no
+    // variance obligation. Both names are guaranteed to be ordinary named
+    // lifetimes: the checker records a violation here only when the return
+    // declares `Kind::Named`, and `$static` returns are reported separately.
+    S.Diag(EscapeExpr->getExprLoc(),
+           diag::note_lifetime_safety_outlives_bound_would_help)
+        << Found << Required;
+  }
+
+  void reportStaticReturnViolation(const Expr *EscapeExpr) override {
+    S.Diag(EscapeExpr->getExprLoc(),
+           diag::warn_lifetime_safety_static_return_violation)
+        << EscapeExpr->getSourceRange();
+  }
+
+  void reportStaticArgumentViolation(const Expr *ArgExpr,
+                                     const ParmVarDecl *PVD) override {
+    S.Diag(ArgExpr->getExprLoc(),
+           diag::warn_lifetime_safety_static_argument_violation)
+        << (PVD ? 0 : 1) << (PVD ? PVD->getName() : llvm::StringRef())
+        << ArgExpr->getSourceRange();
+    if (PVD)
+      S.Diag(PVD->getLocation(), diag::note_lifetime_safety_static_param_here);
+  }
+
+  /// Points at the return type's annotation, which is what establishes the
+  /// contract the parameter is being compared against. It may be absent when
+  /// the lifetime was spelled on a redeclaration that has no `TypeSourceInfo`.
+  void noteReturnLifetime(SourceLocation ReturnLoc, llvm::StringRef Lifetime) {
+    if (ReturnLoc.isValid())
+      S.Diag(ReturnLoc, diag::note_lifetime_safety_return_lifetime_here)
+          << Lifetime;
+  }
+
+  void reportLifetimeboundLifetimeConflict(const ParmVarDecl *PVD,
+                                           llvm::StringRef ParamLifetime,
+                                           llvm::StringRef ReturnLifetime,
+                                           SourceLocation ReturnLoc) override {
+    S.Diag(PVD->getLocation(),
+           diag::warn_lifetime_safety_lifetimebound_lifetime_conflict)
+        << /*implicit object parameter=*/0 << ParamLifetime << ReturnLifetime
+        << PVD->getSourceRange();
+    noteReturnLifetime(ReturnLoc, ReturnLifetime);
+  }
+
+  void suggestLifetimeboundForNamedLifetime(const ParmVarDecl *PVD,
+                                            llvm::StringRef Lifetime,
+                                            SourceLocation ReturnLoc) override {
+    auto [InsertionPoint, FixItText] = getLifetimeBoundFixIt(PVD);
+    S.Diag(InsertionPoint, diag::warn_lifetime_safety_missing_lifetimebound)
+        << /*implicit object parameter=*/0 << Lifetime << PVD->getSourceRange()
+        << FixItHint::CreateInsertion(InsertionPoint, FixItText);
+    noteReturnLifetime(ReturnLoc, Lifetime);
+  }
+
+  void reportLifetimeboundConflictOnImplicitThis(
+      const CXXMethodDecl *MD, llvm::StringRef ThisLifetime,
+      llvm::StringRef ReturnLifetime, SourceLocation ReturnLoc) override {
+    S.Diag(MD->getLocation(),
+           diag::warn_lifetime_safety_lifetimebound_lifetime_conflict)
+        << /*implicit object parameter=*/1 << ThisLifetime << ReturnLifetime;
+    noteReturnLifetime(ReturnLoc, ReturnLifetime);
+  }
+
+  void suggestLifetimeboundForImplicitThis(const CXXMethodDecl *MD,
+                                           llvm::StringRef Lifetime,
+                                           SourceLocation ReturnLoc) override {
+    auto [InsertionPoint, FixItText] = getLifetimeBoundFixIt(MD);
+    S.Diag(InsertionPoint, diag::warn_lifetime_safety_missing_lifetimebound)
+        << /*implicit object parameter=*/1 << Lifetime
+        << FixItHint::CreateInsertion(InsertionPoint, FixItText);
+    noteReturnLifetime(ReturnLoc, Lifetime);
+  }
+
+  void reportLifetimeboundDistinguishedConflict(
+      const ParmVarDecl *PVD, const CXXMethodDecl *MD, bool IsObjectParam,
+      llvm::StringRef ReturnLifetime, SourceLocation ReturnLoc) override {
+    SourceLocation Loc = IsObjectParam ? MD->getLocation() : PVD->getLocation();
+    S.Diag(Loc, diag::warn_lifetime_safety_lifetimebound_distinguished_conflict)
+        << IsObjectParam << ReturnLifetime;
+    noteReturnLifetime(ReturnLoc, ReturnLifetime);
   }
 
   void suggestLifetimeboundToImplicitThis(WarningScope Scope,

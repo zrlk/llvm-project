@@ -46,6 +46,22 @@ struct LifetimeSafetyOpts {
   bool CheckLifetimeboundViolations;
   bool CheckMisplacedLifetimebound;
   bool CheckInapplicableLifetimebound;
+
+  /// Whether to check that named lifetime annotations (`$a`, `LIFETIME_PARAMS`)
+  /// are well formed.
+  bool CheckNamedLifetimes;
+
+  /// Whether to check that a function body honours the lifetimes its signature
+  /// declares.
+  bool CheckNamedLifetimeViolations;
+
+  /// Whether to report a parameter marked `lifetimebound` whose named lifetime
+  /// differs from the one the return type declares.
+  bool CheckLifetimeboundConflict;
+
+  /// Whether to suggest `lifetimebound` on a parameter that shares the return
+  /// type's named lifetime but is not marked.
+  bool SuggestNamedLifetimebound;
 };
 
 /// Enum to track functions visible across or within TU.
@@ -166,6 +182,105 @@ public:
   // Adds inferred lifetime bound attribute for implicit this to its
   // TypeSourceInfo.
   virtual void addLifetimeBoundToImplicitThis(const CXXMethodDecl *MD) {}
+
+  //===--------------------------------------------------------------------===//
+  // Named lifetimes
+  //
+  // These report on the well-formedness of the annotation itself, so they take
+  // source locations rather than expressions: the finding is a property of the
+  // declaration, not of anything in the body.
+  //===--------------------------------------------------------------------===//
+
+  /// Reports \p Found lifetimes written on a type that can only carry
+  /// \p Expected of them. \p Expected of zero means the type cannot carry a
+  /// lifetime at all.
+  virtual void reportLifetimeArityMismatch(SourceLocation Loc, QualType T,
+                                           unsigned Found, unsigned Expected) {}
+
+  /// Reports a lifetime that is used but never introduced by `LIFETIME_PARAMS`.
+  virtual void reportUndeclaredLifetime(SourceLocation Loc,
+                                        llvm::StringRef Name) {}
+
+  /// Reports a lifetime written after the parameter list, where it attaches to
+  /// the function type and is therefore ignored.
+  virtual void reportLifetimeOnFunctionType(SourceLocation Loc) {}
+
+  /// Reports a lifetime introduced more than once by `LIFETIME_PARAMS`.
+  virtual void reportDuplicateLifetimeParam(SourceLocation Loc,
+                                            SourceLocation PrevLoc,
+                                            llvm::StringRef Name) {}
+
+  /// Reports a second `LIFETIME_PARAMS` on the same declaration.
+  virtual void reportRepeatedLifetimeParams(SourceLocation Loc,
+                                            SourceLocation PrevLoc) {}
+
+  /// Reports an annotation argument that is not a string literal, which
+  /// includes template-dependent arguments: Clang does not substitute
+  /// `annotate_type` arguments when a template is instantiated.
+  virtual void reportNonLiteralLifetimeArgument(SourceLocation Loc) {}
+
+  /// Reports a definition whose written lifetimes disagree with those on a
+  /// previous declaration. Type annotations do not merge across
+  /// redeclarations, so the two would otherwise silently describe different
+  /// contracts.
+  virtual void reportConflictingLifetimeSignature(const FunctionDecl *FDef,
+                                                  const FunctionDecl *FDecl) {}
+
+  /// Reports a lifetime introduced by `LIFETIME_PARAMS` that is one of the
+  /// distinguished names. `$static` and `$unknown` mean something fixed, so a
+  /// declaration of them cannot introduce anything.
+  virtual void reportReservedLifetimeParam(SourceLocation Loc,
+                                           llvm::StringRef Name) {}
+
+  /// Reports a returned value that borrows from lifetime \p Found where the
+  /// return type declares \p Required.
+  virtual void reportNamedLifetimeViolation(const Expr *ReturnExpr,
+                                            llvm::StringRef Found,
+                                            llvm::StringRef Required) {}
+
+  /// Reports a returned value that borrows from the caller's storage where the
+  /// return type declares `$static`. Unlike a named lifetime, `$static` is not
+  /// satisfied by an arbitrary caller-supplied position.
+  virtual void reportStaticReturnViolation(const Expr *ReturnExpr) {}
+
+  /// Reports an argument passed to a parameter declaring `$static` whose
+  /// storage is not known to live that long. \p PVD is null for the implicit
+  /// object argument.
+  virtual void reportStaticArgumentViolation(const Expr *ArgExpr,
+                                             const ParmVarDecl *PVD) {}
+
+  /// Reports a parameter marked `lifetimebound` -- asserting the result may
+  /// borrow from it -- whose named lifetime differs from the one the return
+  /// type declares. \p ReturnLoc points at the return type's annotation.
+  virtual void reportLifetimeboundLifetimeConflict(
+      const ParmVarDecl *PVD, llvm::StringRef ParamLifetime,
+      llvm::StringRef ReturnLifetime, SourceLocation ReturnLoc) {}
+
+  /// Suggests `lifetimebound` on a parameter that already shares the return
+  /// type's named lifetime \p Lifetime. \p ReturnLoc points at the return
+  /// type's annotation.
+  virtual void suggestLifetimeboundForNamedLifetime(const ParmVarDecl *PVD,
+                                                    llvm::StringRef Lifetime,
+                                                    SourceLocation ReturnLoc) {}
+
+  /// As above, for the implicit object parameter, whose lifetime is written
+  /// after the parameter list.
+  virtual void reportLifetimeboundConflictOnImplicitThis(
+      const CXXMethodDecl *MD, llvm::StringRef ThisLifetime,
+      llvm::StringRef ReturnLifetime, SourceLocation ReturnLoc) {}
+
+  virtual void suggestLifetimeboundForImplicitThis(const CXXMethodDecl *MD,
+                                                   llvm::StringRef Lifetime,
+                                                   SourceLocation ReturnLoc) {}
+
+  /// Reports a `lifetimebound` position on a function whose return declares
+  /// `$static` or `$unknown`. Neither borrows from anything the caller passes
+  /// in, so the two annotations describe different contracts; the signature is
+  /// the one the analysis follows. \p IsObjectParam selects the implicit
+  /// object parameter, in which case \p PVD is null.
+  virtual void reportLifetimeboundDistinguishedConflict(
+      const ParmVarDecl *PVD, const CXXMethodDecl *MD, bool IsObjectParam,
+      llvm::StringRef ReturnLifetime, SourceLocation ReturnLoc) {}
 };
 
 /// The main entry point for the analysis.

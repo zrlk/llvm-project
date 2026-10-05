@@ -24,6 +24,8 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/TimeProfiler.h"
 
@@ -61,6 +63,31 @@ private:
   llvm::DenseMap<AnnotationTarget, EscapingTarget> AnnotationWarningsMap;
   llvm::DenseMap<const ParmVarDecl *, EscapingTarget> NoescapeWarningsMap;
   llvm::DenseSet<const Decl *> VerifiedLiftimeboundEscapes;
+  /// Returns whose value borrows from a lifetime other than the one the return
+  /// type declares, keyed by the return expression.
+  llvm::MapVector<const Expr *, llvm::StringRef> LifetimeViolations;
+  /// Returns whose value borrows from caller storage that a `$static` return
+  /// type does not accept.
+  llvm::SetVector<const Expr *> StaticReturnViolations;
+  /// Arguments passed to a `$static` position whose storage can expire, mapped
+  /// to the parameter that imposed the obligation (null for the implicit
+  /// object argument).
+  llvm::MapVector<const Expr *, const ParmVarDecl *> StaticArgumentViolations;
+  /// The lifetime declared on the outermost level of the return type, if any.
+  llvm::StringRef RequiredReturnLifetime;
+  /// The kind of the lifetime declared on the outermost level of the return
+  /// type. `Named` is accompanied by `RequiredReturnLifetime`; the
+  /// distinguished kinds are checked differently and carry no name.
+  LifetimeVar::Kind ReturnLifetimeKind = LifetimeVar::Kind::Elided;
+  /// The outermost lifetime kind written on each parameter, plus the implicit
+  /// object parameter keyed by its method.
+  ///
+  /// Loans for `$static` and `$unknown` are deliberately not minted -- they
+  /// would appear in every loan set that touched such a parameter -- so what a
+  /// position promises has to be recovered from the signature instead. Only
+  /// the outermost level is recorded, because a parameter is given exactly one
+  /// placeholder loan however deep its type is.
+  llvm::DenseMap<const Decl *, LifetimeVar::Kind> ParamLifetimeKinds;
   const LoanPropagationAnalysis &LoanPropagation;
   const MovedLoansAnalysis &MovedLoans;
   const LiveOriginsAnalysis &LiveOrigins;
@@ -95,6 +122,23 @@ public:
         LiveOrigins(LiveOrigins), FactMgr(FM), SemaHelper(SemaHelper),
         AST(ADC.getASTContext()), Cfg(ADC.getCFG()), FD(ADC.getDecl()),
         LSOpts(LSOpts) {
+    if (const auto *Fn = dyn_cast_if_present<FunctionDecl>(FD)) {
+      LifetimeSignature Sig = getLifetimeSignature(AST, Fn);
+      // Only the outermost level of the return is checked; distributing the
+      // inner levels is future work.
+      if (!Sig.Return.empty()) {
+        ReturnLifetimeKind = Sig.Return.front().getKind();
+        if (ReturnLifetimeKind == LifetimeVar::Kind::Named)
+          RequiredReturnLifetime = Sig.Return.front().getName();
+      }
+      for (unsigned I = 0, E = Fn->getNumParams(); I != E; ++I)
+        if (I < Sig.Params.size() && !Sig.Params[I].empty())
+          ParamLifetimeKinds[Fn->getParamDecl(I)] =
+              Sig.Params[I].front().getKind();
+      if (const auto *MD = dyn_cast<CXXMethodDecl>(Fn);
+          MD && MD->isInstance() && !Sig.FunctionType.empty())
+        ParamLifetimeKinds[MD] = Sig.FunctionType.front().getKind();
+    }
     for (const CFGBlock *B : *ADC.getAnalysis<PostOrderCFGView>())
       for (const Fact *F : FactMgr.getFacts(B))
         if (const auto *EF = F->getAs<ExpireFact>())
@@ -103,6 +147,8 @@ public:
           checkInvalidation(IOF);
         else if (const auto *OEF = F->getAs<OriginEscapesFact>())
           checkAnnotations(OEF);
+        else if (const auto *SOF = F->getAs<StaticObligationFact>())
+          checkStaticObligation(SOF);
     issuePendingWarnings();
     suggestAnnotations();
     if (LSOpts.CheckNoescapeViolations)
@@ -113,6 +159,8 @@ public:
       reportMisplacedLifetimebound();
     if (LSOpts.CheckInapplicableLifetimebound)
       reportInapplicableLifetimebound();
+    if (LSOpts.CheckNamedLifetimeViolations)
+      reportNamedLifetimeViolations();
     //  Annotation inference is currently guarded by a frontend flag. In the
     //  future, this might be replaced by a design that differentiates between
     //  explicit and inferred findings with separate warning groups.
@@ -171,17 +219,113 @@ public:
           AnnotationWarningsMap.try_emplace(MD, ReturnEsc->getReturnExpr());
       }
     };
+    auto CheckNamedLifetime = [&](const NamedLifetime *NL) {
+      // The contract only constrains what is returned.
+      const auto *ReturnEsc = dyn_cast<ReturnEscapeFact>(OEF);
+      if (!ReturnEsc || RequiredReturnLifetime.empty())
+        return;
+      if (NL->getName() == RequiredReturnLifetime)
+        return;
+      // With no outlives relation between lifetimes, the acceptance set for
+      // `$a` is exactly `{$a}`.
+      LifetimeViolations.try_emplace(ReturnEsc->getReturnExpr(), NL->getName());
+    };
+    // A `$static` return promises storage that never expires, which nothing
+    // the caller passes in provides -- unless the caller was itself told to
+    // pass storage that never expires. \p Source is the position the loan came
+    // from, or null for a loan minted from a named lifetime, which is
+    // caller-scoped by construction.
+    auto CheckStaticReturn = [&](const Decl *Source) {
+      if (ReturnLifetimeKind != LifetimeVar::Kind::Static)
+        return;
+      const auto *ReturnEsc = dyn_cast<ReturnEscapeFact>(OEF);
+      if (!ReturnEsc)
+        return;
+      if (Source && declaresStaticSafeLifetime(Source))
+        return;
+      StaticReturnViolations.insert(ReturnEsc->getReturnExpr());
+    };
     auto MovedAtEscape = MovedLoans.getMovedLoans(OEF);
     for (LoanID LID : EscapedLoans) {
       const Loan *L = FactMgr.getLoanMgr().getLoan(LID);
       const PlaceholderBase *PB = L->getAccessPath().getAsPlaceholderBase();
       if (!PB)
         continue;
-      if (const auto *PVD = PB->getParmVarDecl())
+      if (const auto *PVD = PB->getParmVarDecl()) {
         CheckParam(PVD, /*IsMoved=*/MovedAtEscape.lookup(LID));
-      else if (const auto *MD = PB->getImplicitThisParent())
+        CheckStaticReturn(PVD);
+      } else if (const auto *MD = PB->getImplicitThisParent()) {
         CheckImplicitThis(MD);
+        CheckStaticReturn(MD);
+      } else if (const auto *NL = PB->getNamedLifetime()) {
+        CheckNamedLifetime(NL);
+        CheckStaticReturn(/*Source=*/nullptr);
+      }
     }
+  }
+
+  /// Whether \p D is a position whose storage the caller has been told will
+  /// never expire.
+  ///
+  /// `$unknown` counts. It is an explicit assertion that no lifetime applies,
+  /// so honouring it here is what makes it an opt-out rather than a silent
+  /// source of diagnostics.
+  bool declaresStaticSafeLifetime(const Decl *D) const {
+    auto It = ParamLifetimeKinds.find(D);
+    if (It == ParamLifetimeKinds.end())
+      return false;
+    return It->second == LifetimeVar::Kind::Static ||
+           It->second == LifetimeVar::Kind::Unknown;
+  }
+
+  /// Whether a loan on \p AP names storage that cannot expire while the
+  /// program runs, which is what a `$static` position demands.
+  bool livesForever(const AccessPath &AP) const {
+    if (const auto *VD = AP.getAsValueDecl()) {
+      const auto *Var = dyn_cast<VarDecl>(VD);
+      return Var && Var->hasGlobalStorage();
+    }
+    // Heap storage does not expire on scope exit. Freeing it is a separate
+    // problem, which `InvalidateOriginFact` already reports.
+    if (AP.getAsNewAllocation())
+      return true;
+    if (const auto *PB = AP.getAsPlaceholderBase()) {
+      if (const auto *PVD = PB->getParmVarDecl())
+        return declaresStaticSafeLifetime(PVD);
+      if (const auto *MD = PB->getImplicitThisParent())
+        return declaresStaticSafeLifetime(MD);
+      // A loan minted from a named lifetime stands for caller storage of
+      // unknown duration.
+      return false;
+    }
+    // A materialized temporary, and anything else, expires.
+    return false;
+  }
+
+  /// Checks an argument passed to a `$static` position against the loans it
+  /// holds at the call.
+  void checkStaticObligation(const StaticObligationFact *SOF) {
+    for (LoanID LID : LoanPropagation.getLoans(SOF->getOriginID(), SOF)) {
+      const Loan *L = FactMgr.getLoanMgr().getLoan(LID);
+      if (livesForever(L->getAccessPath()))
+        continue;
+      StaticArgumentViolations.try_emplace(SOF->getArgExpr(), SOF->getParam());
+      return;
+    }
+  }
+
+  /// Reports values that do not satisfy the lifetime the signature demands of
+  /// them, whether on the way out of the function or into a call.
+  void reportNamedLifetimeViolations() {
+    if (!SemaHelper)
+      return;
+    for (const auto &[ReturnExpr, Found] : LifetimeViolations)
+      SemaHelper->reportNamedLifetimeViolation(ReturnExpr, Found,
+                                               RequiredReturnLifetime);
+    for (const Expr *ReturnExpr : StaticReturnViolations)
+      SemaHelper->reportStaticReturnViolation(ReturnExpr);
+    for (const auto &[ArgExpr, PVD] : StaticArgumentViolations)
+      SemaHelper->reportStaticArgumentViolation(ArgExpr, PVD);
   }
 
   /// Checks for use-after-free & use-after-return errors when an access path

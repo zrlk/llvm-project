@@ -119,12 +119,14 @@ public:
     return Lattice(L.PersistentOrigins, OriginLoanMapFactory.getEmptyMap());
   }
 
-  /// A new loan is issued to the origin. Old loans are erased.
+  /// A new loan is issued to the origin. Old loans are erased, unless the fact
+  /// is additive, in which case the new loan joins them.
   Lattice transfer(Lattice In, const IssueFact &F) {
     OriginID OID = F.getOriginID();
     LoanID LID = F.getLoanID();
-    LoanSet NewLoans = LoanSetFactory.add(LoanSetFactory.getEmptySet(), LID);
-    return setLoans(In, OID, NewLoans);
+    LoanSet Base =
+        F.isAdditive() ? getLoans(In, OID) : LoanSetFactory.getEmptySet();
+    return setLoans(In, OID, LoanSetFactory.add(Base, LID));
   }
 
   /// A flow from source to destination. If `KillDest` is true, this replaces

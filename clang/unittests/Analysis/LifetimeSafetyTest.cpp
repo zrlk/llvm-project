@@ -34,6 +34,18 @@ public:
     std::string FullCode = R"(
       #define POINT(name) void("__lifetime_test_point_" #name)
 
+      // Crubit spells lifetimes through macros, and so does every test that
+      // uses them. Each name needs its own alias: `$a` alone is a parse error,
+      // it has to expand from a macro of that name.
+      #define $(l) [[clang::annotate_type("lifetime", #l)]]
+      #define LIFETIME_PARAMS(...) \
+          [[clang::annotate("lifetime_params", __VA_ARGS__)]]
+      #define $a $(a)
+      #define $b $(b)
+      #define $static $(static)
+      #define $unknown $(unknown)
+      #define LB [[clang::lifetimebound]]
+
       struct [[gsl::Owner]] MyObj { ~MyObj() {} int i; };
 
       struct [[gsl::Pointer()]] View { 
@@ -141,6 +153,94 @@ public:
       return {};
     }
     return LID;
+  }
+
+  /// The origin of \p VarName at indirection level \p Level, counting
+  /// outermost-first: for `int** p`, level 0 is `p` and level 1 is `*p`.
+  std::optional<OriginID> getOriginForDeclAtLevel(llvm::StringRef VarName,
+                                                  unsigned Level) {
+    auto *VD = findDecl<ValueDecl>(VarName);
+    if (!VD)
+      return std::nullopt;
+    OriginList *List =
+        const_cast<OriginManager &>(Analysis.getFactManager().getOriginMgr())
+            .getOrCreateList(VD);
+    for (unsigned I = 0; I != Level && List; ++I)
+      List = List->peelOuterOrigin();
+    if (!List) {
+      ADD_FAILURE() << "'" << VarName << "' has no origin at level " << Level;
+      return std::nullopt;
+    }
+    return List->getOuterOriginID();
+  }
+
+  const Loan *getLoan(LoanID LID) {
+    return Analysis.getFactManager().getLoanMgr().getLoan(LID);
+  }
+
+  /// Returns the ordinary placeholder loan \p ParamName receives at entry.
+  ///
+  /// Every parameter gets one of these regardless of annotation, and it is
+  /// distinct from any loan minted for a lifetime the parameter names.
+  std::optional<LoanID> findParamPlaceholderLoan(llvm::StringRef ParamName) {
+    const auto *PVD = findDecl<ParmVarDecl>(ParamName);
+    if (!PVD)
+      return std::nullopt;
+    for (const Loan *L : Analysis.getFactManager().getLoanMgr().getLoans())
+      if (const PlaceholderBase *PB = L->getAccessPath().getAsPlaceholderBase())
+        if (PB->getParmVarDecl() == PVD)
+          return L->getID();
+    return std::nullopt;
+  }
+
+  /// Returns the placeholder loan for the implicit object parameter.
+  std::optional<LoanID> findThisPlaceholderLoan() {
+    for (const Loan *L : Analysis.getFactManager().getLoanMgr().getLoans())
+      if (const PlaceholderBase *PB = L->getAccessPath().getAsPlaceholderBase())
+        if (PB->getImplicitThisParent())
+          return L->getID();
+    return std::nullopt;
+  }
+
+  /// Returns the loan standing for the named lifetime \p Name, or nullopt if
+  /// the analysis never minted one.
+  ///
+  /// The nullopt case is load-bearing: `$static` and `$unknown` are
+  /// deliberately not given loans, and a test asserts that.
+  std::optional<LoanID> findNamedLifetimeLoan(llvm::StringRef Name) {
+    for (const Loan *L : Analysis.getFactManager().getLoanMgr().getLoans())
+      if (const PlaceholderBase *PB = L->getAccessPath().getAsPlaceholderBase())
+        if (const NamedLifetime *NL = PB->getNamedLifetime())
+          if (NL->getName() == Name)
+            return L->getID();
+    return std::nullopt;
+  }
+
+  /// The outermost origin of the implicit object parameter.
+  std::optional<OriginID> getThisOrigin() {
+    std::optional<OriginList *> List =
+        Analysis.getFactManager().getOriginMgr().getThisOrigins();
+    if (!List || !*List)
+      return std::nullopt;
+    return (*List)->getOuterOriginID();
+  }
+
+  /// For every `$static` obligation the analysis recorded, the loans the
+  /// obliged origin holds at that point -- which is exactly what the checker
+  /// inspects to decide whether the obligation is met.
+  std::vector<std::vector<LoanID>> getStaticObligationLoans() {
+    std::vector<std::vector<LoanID>> Result;
+    const CFG *Cfg = Runner.getAnalysisContext().getCFG();
+    if (!Cfg)
+      return Result;
+    for (const CFGBlock *B : *Cfg)
+      for (const Fact *F : Analysis.getFactManager().getFacts(B))
+        if (const auto *SOF = F->getAs<StaticObligationFact>()) {
+          LoanSet Loans =
+              Analysis.getLoanPropagation().getLoans(SOF->getOriginID(), SOF);
+          Result.emplace_back(Loans.begin(), Loans.end());
+        }
+    return Result;
   }
 
   bool isLoanToATemporary(LoanID LID) {
@@ -282,6 +382,24 @@ public:
   LifetimeTestHelper &Helper;
 };
 
+/// Names one loan an origin is expected to hold.
+///
+/// `HasLoansTo` can only name loans whose access path is a `ValueDecl`, so it
+/// silently ignores the placeholder loans a parameter carries. That is exactly
+/// how a bug where a named loan *displaced* a parameter's own placeholder loan
+/// survived a green suite, so anything asserting on a signature's loan sets
+/// needs to be able to name all four kinds.
+struct ExpectedLoan {
+  enum class Kind {
+    Var,      ///< Every loan to the storage of a local variable.
+    Param,    ///< The placeholder loan a parameter receives at entry.
+    This,     ///< The placeholder loan for the implicit object parameter.
+    Lifetime, ///< The loan standing for a named lifetime.
+  };
+  Kind K;
+  std::string Name;
+};
+
 // A helper class to represent a set of origins, identified by variable names.
 class OriginsInfo {
 public:
@@ -346,6 +464,111 @@ MATCHER_P2(HasLoansToImpl, LoanVars, Annotation, "") {
 
   return ExplainMatchResult(UnorderedElementsAreArray(ExpectedLoans),
                             ActualLoans, result_listener);
+}
+
+/// Describes a loan the way it is written in source, so a failure says which
+/// loan is missing rather than which integer is.
+static std::string describeLoan(const Loan *L) {
+  const AccessPath &AP = L->getAccessPath();
+  if (const ValueDecl *VD = AP.getAsValueDecl())
+    return ("&" + VD->getName()).str();
+  if (const PlaceholderBase *PB = AP.getAsPlaceholderBase()) {
+    if (const ParmVarDecl *PVD = PB->getParmVarDecl())
+      return ("placeholder(" + PVD->getName() + ")").str();
+    if (PB->getImplicitThisParent())
+      return "placeholder(this)";
+    if (const NamedLifetime *NL = PB->getNamedLifetime())
+      return ("$" + NL->getName()).str();
+  }
+  if (AP.getAsMaterializeTemporaryExpr())
+    return "temporary";
+  if (AP.getAsNewAllocation())
+    return "new";
+  return "?";
+}
+
+/// Matcher verifying the *complete* loan set an origin holds at a program
+/// point, including placeholder loans.
+MATCHER_P2(HoldsExactlyImpl, Expected, Annotation, "") {
+  const OriginInfo &Info = arg;
+  auto &Helper = Info.Helper;
+
+  std::optional<OriginID> OIDOpt = Helper.getOriginForDecl(Info.OriginVar);
+  if (!OIDOpt) {
+    *result_listener << "could not find origin for '" << Info.OriginVar.str()
+                     << "'";
+    return false;
+  }
+  std::optional<LoanSet> ActualSetOpt =
+      Helper.getLoansAtPoint(*OIDOpt, Annotation);
+  if (!ActualSetOpt) {
+    *result_listener << "could not get a valid loan set at point '"
+                     << Annotation << "'";
+    return false;
+  }
+
+  std::vector<LoanID> ExpectedLoans;
+  for (const ExpectedLoan &E : Expected) {
+    switch (E.K) {
+    case ExpectedLoan::Kind::Var: {
+      std::vector<LoanID> LIDs = Helper.getLoansForVar(E.Name);
+      if (LIDs.empty()) {
+        *result_listener << "no loan to variable '" << E.Name << "'";
+        return false;
+      }
+      ExpectedLoans.insert(ExpectedLoans.end(), LIDs.begin(), LIDs.end());
+      break;
+    }
+    case ExpectedLoan::Kind::Param: {
+      std::optional<LoanID> LID = Helper.findParamPlaceholderLoan(E.Name);
+      if (!LID) {
+        *result_listener << "no placeholder loan for parameter '" << E.Name
+                         << "'";
+        return false;
+      }
+      ExpectedLoans.push_back(*LID);
+      break;
+    }
+    case ExpectedLoan::Kind::This: {
+      std::optional<LoanID> LID = Helper.findThisPlaceholderLoan();
+      if (!LID) {
+        *result_listener << "no placeholder loan for the implicit object "
+                            "parameter";
+        return false;
+      }
+      ExpectedLoans.push_back(*LID);
+      break;
+    }
+    case ExpectedLoan::Kind::Lifetime: {
+      std::optional<LoanID> LID = Helper.findNamedLifetimeLoan(E.Name);
+      if (!LID) {
+        *result_listener << "no loan was minted for lifetime '$" << E.Name
+                         << "'";
+        return false;
+      }
+      ExpectedLoans.push_back(*LID);
+      break;
+    }
+    }
+  }
+
+  std::vector<LoanID> ActualLoans(ActualSetOpt->begin(), ActualSetOpt->end());
+  std::sort(ExpectedLoans.begin(), ExpectedLoans.end());
+  std::sort(ActualLoans.begin(), ActualLoans.end());
+  if (ExpectedLoans != ActualLoans) {
+    auto Render = [&](const std::vector<LoanID> &Loans) {
+      *result_listener << "{";
+      for (LoanID LID : Loans)
+        *result_listener << " " << describeLoan(Helper.getLoan(LID));
+      *result_listener << " }";
+    };
+    *result_listener << "expected ";
+    Render(ExpectedLoans);
+    *result_listener << ", actual ";
+    Render(ActualLoans);
+    return false;
+  }
+  return true;
 }
 
 enum class LivenessKindFilter { Maybe, Must, All };
@@ -515,6 +738,28 @@ protected:
 
   auto HasLiveLoanAtExpiry(const char *Annotation) {
     return HasLiveLoanAtExpiryImpl(Helper.get(), Annotation);
+  }
+
+  /// Names for the four kinds of loan `HoldsExactly` can assert on.
+  static ExpectedLoan VarLoan(llvm::StringRef Var) {
+    return {ExpectedLoan::Kind::Var, Var.str()};
+  }
+  static ExpectedLoan ParamLoan(llvm::StringRef Param) {
+    return {ExpectedLoan::Kind::Param, Param.str()};
+  }
+  static ExpectedLoan ThisLoan() { return {ExpectedLoan::Kind::This, ""}; }
+  static ExpectedLoan LifetimeLoan(llvm::StringRef Name) {
+    return {ExpectedLoan::Kind::Lifetime, Name.str()};
+  }
+
+  /// Asserts the complete loan set, placeholder loans included.
+  auto HoldsExactly(std::initializer_list<ExpectedLoan> Loans,
+                    const char *Annotation) {
+    return HoldsExactlyImpl(std::vector<ExpectedLoan>(Loans), Annotation);
+  }
+
+  auto HoldsNoLoans(const char *Annotation) {
+    return HoldsExactlyImpl(std::vector<ExpectedLoan>(), Annotation);
   }
 
   std::unique_ptr<LifetimeTestRunner> Runner;
@@ -2225,5 +2470,263 @@ TEST_F(LifetimeAnalysisTest, BuildOriginFlowChainWithLifetimeBound) {
   EXPECT_THAT(ChainForTgtB, Contains(*Helper->getOriginForDecl("result")));
   EXPECT_THAT(ChainForTgtB, Not(Contains(*Helper->getOriginForDecl("a"))));
 }
+// ========================================================================= //
+//                          Named lifetime signatures
+// ========================================================================= //
+//
+// These assert on loan sets rather than on diagnostics. The lit tests under
+// test/Sema/LifetimeSafety cover the diagnostics; nothing there can see the
+// state they are derived from. A bug where a named loan displaced a
+// parameter's own placeholder loan survived two phases of a fully green suite
+// for exactly that reason, so the invariants below are stated directly.
+//
+// A note for anyone adding to this section: a parameter's placeholder loans
+// are issued into the CFG *entry* block, and an origin only survives across
+// blocks if `FactManager::calculatePersistentOrigins` sees it in two or more
+// of them. A parameter the body never touches therefore appears exactly once,
+// is not persistent, and holds *no* loans at any later POINT. Every test below
+// gives each parameter under test a real use before the POINT. This is not a
+// defect in the analysis -- nothing can observe an untouched parameter's loans
+// -- but it does mean a body of just `POINT(p);` silently measures nothing.
+
+TEST_F(LifetimeAnalysisTest, NamedLifetimeLoanIsAdditive) {
+  SetupTest(R"(
+    LIFETIME_PARAMS("a")
+    void target(int* $a p) {
+      int* use = p;
+      POINT(entry);
+    }
+  )");
+  // Regression: the named loan is issued *in addition to* the placeholder loan
+  // every parameter already carries. Issuing it non-additively erased the
+  // latter, and `lifetimebound` verification searches the escaped set for
+  // precisely that loan.
+  EXPECT_THAT(Origin("p"),
+              HoldsExactly({ParamLoan("p"), LifetimeLoan("a")}, "entry"));
+}
+
+TEST_F(LifetimeAnalysisTest, ImplicitObjectNamedLoanIsAdditive) {
+  SetupTest(R"(
+    struct S {
+      int x;
+      LIFETIME_PARAMS("a")
+      int* $a target() $a {
+        POINT(entry);
+        return &x;
+      }
+    };
+  )");
+  // The same invariant on the other placeholder kind. `this` has no ValueDecl,
+  // so it cannot go through the matcher.
+  std::optional<OriginID> This = Helper->getThisOrigin();
+  ASSERT_TRUE(This.has_value());
+  std::optional<LoanSet> Loans = Helper->getLoansAtPoint(*This, "entry");
+  ASSERT_TRUE(Loans.has_value());
+  EXPECT_THAT(std::vector<LoanID>(Loans->begin(), Loans->end()),
+              UnorderedElementsAreArray({*Helper->findThisPlaceholderLoan(),
+                                         *Helper->findNamedLifetimeLoan("a")}));
+}
+
+TEST_F(LifetimeAnalysisTest, PositionsSharingALifetimeShareOneLoan) {
+  SetupTest(R"(
+    LIFETIME_PARAMS("a", "b")
+    void target(int* $a p, int* $a q, int* $b r) {
+      int* up = p;
+      int* uq = q;
+      int* ur = r;
+      POINT(entry);
+    }
+  )");
+  // Sharing the loan is what makes two `$a` positions indistinguishable, which
+  // is what the annotation asserts.
+  EXPECT_THAT(Origin("p"),
+              HoldsExactly({ParamLoan("p"), LifetimeLoan("a")}, "entry"));
+  EXPECT_THAT(Origin("q"),
+              HoldsExactly({ParamLoan("q"), LifetimeLoan("a")}, "entry"));
+  EXPECT_THAT(Origin("r"),
+              HoldsExactly({ParamLoan("r"), LifetimeLoan("b")}, "entry"));
+}
+
+TEST_F(LifetimeAnalysisTest, UnannotatedParameterGetsNoLifetimeLoan) {
+  SetupTest(R"(
+    LIFETIME_PARAMS("a")
+    void target(int* $a p, int* q) {
+      int* up = p;
+      int* uq = q;
+      POINT(entry);
+    }
+  )");
+  EXPECT_THAT(Origin("q"), HoldsExactly({ParamLoan("q")}, "entry"));
+}
+
+TEST_F(LifetimeAnalysisTest, NoLoanIsMintedForDistinguishedLifetimes) {
+  SetupTest(R"(
+    void target(int* $static s, int* $unknown u) {
+      int* us = s;
+      int* uu = u;
+      POINT(entry);
+    }
+  )");
+  // P3 decided against minting distinguished placeholder loans: such a loan
+  // would land in every loan set that touched the parameter, for no
+  // information the signature does not already carry. What a position promises
+  // is recovered from the signature instead.
+  EXPECT_FALSE(Helper->findNamedLifetimeLoan("static").has_value());
+  EXPECT_FALSE(Helper->findNamedLifetimeLoan("unknown").has_value());
+  EXPECT_THAT(Origin("s"), HoldsExactly({ParamLoan("s")}, "entry"));
+  EXPECT_THAT(Origin("u"), HoldsExactly({ParamLoan("u")}, "entry"));
+}
+
+TEST_F(LifetimeAnalysisTest, CallResultBorrowsOnlyTheMatchingArgument) {
+  SetupTest(R"(
+    LIFETIME_PARAMS("a", "b")
+    int* $a pick(int* $a x, int* $b y);
+    void target() {
+      int a, b;
+      int* r = pick(&a, &b);
+      POINT(after);
+    }
+  )");
+  // The precision `lifetimebound` cannot express: `b` reaches the second
+  // parameter but not the result.
+  EXPECT_THAT(Origin("r"), HoldsExactly({VarLoan("a")}, "after"));
+}
+
+TEST_F(LifetimeAnalysisTest, LifetimeboundUnionsWhatASignatureSeparates) {
+  SetupTest(R"(
+    int* both(int* x LB, int* y LB);
+    void target() {
+      int a, b;
+      int* r = both(&a, &b);
+      POINT(after);
+    }
+  )");
+  // The contrast case for the test above, on otherwise identical code.
+  EXPECT_THAT(Origin("r"), HoldsExactly({VarLoan("a"), VarLoan("b")}, "after"));
+}
+
+TEST_F(LifetimeAnalysisTest, EveryAnnotatedLevelFlows) {
+  SetupTest(R"(
+    LIFETIME_PARAMS("a", "b")
+    int* $b * $a get(int* $b * $a p, int* $a * $b q);
+    void target(int** p, int** q) {
+      int** r = get(p, q);
+      POINT(after);
+    }
+  )");
+  // `q` reverses the two lifetimes, so the result's outer level (`$a`) borrows
+  // from p's outer level and from q's inner one. Matching by name is what makes
+  // the differing list lengths a non-issue.
+  //
+  // Note what is *not* here: a loan for `$a`. Call-site substitution only flows
+  // origins; named loans are minted solely by `issuePlaceholderLoans`, for the
+  // function under analysis. `target` carries no annotations of its own, so the
+  // result holds exactly the loans its arguments carry -- and q's inner level
+  // holds none, because a parameter gets one placeholder loan at its outermost
+  // level regardless of indirection depth.
+  EXPECT_THAT(Origin("r"), HoldsExactly({ParamLoan("p")}, "after"));
+}
+
+TEST_F(LifetimeAnalysisTest, UnknownReturnYieldsNoLoans) {
+  SetupTest(R"(
+    LIFETIME_PARAMS("a")
+    int* $unknown opaque(int* $a x LB);
+    void target() {
+      int a;
+      int* r = opaque(&a);
+      POINT(after);
+    }
+  )");
+  // `$unknown` asserts no lifetime applies. Before P3 the call fell through to
+  // the `lifetimebound` union and the result held a loan to `a` -- the exact
+  // opposite of what the annotation says.
+  EXPECT_THAT(Origin("r"), HoldsNoLoans("after"));
+}
+
+TEST_F(LifetimeAnalysisTest, StaticReturnYieldsNoLoans) {
+  SetupTest(R"(
+    LIFETIME_PARAMS("a")
+    int* $static forever(int* $a x LB);
+    void target() {
+      int a;
+      int* r = forever(&a);
+      POINT(after);
+    }
+  )");
+  EXPECT_THAT(Origin("r"), HoldsNoLoans("after"));
+}
+
+TEST_F(LifetimeAnalysisTest, BareReturnStillFallsBackToLifetimebound) {
+  SetupTest(R"(
+    LIFETIME_PARAMS("a")
+    int* bare(int* $a x LB);
+    void target() {
+      int a;
+      int* r = bare(&a);
+      POINT(after);
+    }
+  )");
+  // A signature that annotates parameters but leaves the return bare says
+  // nothing about what the call yields, so `lifetimebound` stays in force.
+  // This is what keeps the feature from silently *removing* detection.
+  EXPECT_THAT(Origin("r"), HoldsExactly({VarLoan("a")}, "after"));
+}
+
+TEST_F(LifetimeAnalysisTest, StaticParameterImposesObligationOnItsArgument) {
+  SetupTest(R"(
+    void sink(int* $static p);
+    void target() {
+      int x;
+      sink(&x);
+      POINT(after);
+    }
+  )");
+  // The obligation is recorded even though `sink` returns void, and it is
+  // decided by the loans the argument holds at the call.
+  std::vector<std::vector<LoanID>> Obligations =
+      Helper->getStaticObligationLoans();
+  ASSERT_THAT(Obligations, SizeIs(1));
+  EXPECT_THAT(Obligations[0],
+              UnorderedElementsAreArray(Helper->getLoansForVar("x")));
+}
+
+TEST_F(LifetimeAnalysisTest, StaticObligationSeesEveryReachingLoan) {
+  SetupTest(R"(
+    void sink(int* $static p);
+    void target(bool c) {
+      int x, y;
+      int* p = c ? &x : &y;
+      sink(p);
+      POINT(after);
+    }
+  )");
+  // The point query runs at the call, after the join, so both branches are
+  // visible to it.
+  std::vector<std::vector<LoanID>> Obligations =
+      Helper->getStaticObligationLoans();
+  ASSERT_THAT(Obligations, SizeIs(1));
+  std::vector<LoanID> Expected = Helper->getLoansForVar("x");
+  for (LoanID LID : Helper->getLoansForVar("y"))
+    Expected.push_back(LID);
+  EXPECT_THAT(Obligations[0], UnorderedElementsAreArray(Expected));
+}
+
+TEST_F(LifetimeAnalysisTest, NoObligationWithoutAStaticParameter) {
+  SetupTest(R"(
+    LIFETIME_PARAMS("a")
+    void sink_named(int* $a p);
+    void sink_plain(int* p);
+    void sink_unknown(int* $unknown p);
+    void target() {
+      int x;
+      sink_named(&x);
+      sink_plain(&x);
+      sink_unknown(&x);
+      POINT(after);
+    }
+  )");
+  EXPECT_THAT(Helper->getStaticObligationLoans(), SizeIs(0));
+}
+
 } // anonymous namespace
 } // namespace clang::lifetimes::internal

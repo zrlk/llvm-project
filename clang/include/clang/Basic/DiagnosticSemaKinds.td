@@ -11074,6 +11074,117 @@ def warn_lifetime_safety_inapplicable_lifetimebound
       InGroup<LifetimeSafetyInapplicableLifetimebound>,
       DefaultIgnore;
 
+// Named lifetimes.
+def warn_lifetime_safety_lifetime_arity_mismatch
+    : Warning<"type %0 takes %plural{0:no lifetime annotations|"
+              "1:one lifetime annotation|:%1 lifetime annotations}1, but %2 "
+              "%plural{1:was|:were}2 written">,
+      InGroup<LifetimeSafetyNamedLifetimes>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_undeclared_lifetime
+    : Warning<"lifetime '%0' is not declared by this function; "
+              "add it to a LIFETIME_PARAMS annotation">,
+      InGroup<LifetimeSafetyUndeclaredLifetime>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_lifetime_on_function_type
+    : Warning<"lifetime annotation after the parameter list applies to the "
+              "function type and is ignored; write it on the return type "
+              "instead">,
+      InGroup<LifetimeSafetyNamedLifetimes>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_duplicate_lifetime_param
+    : Warning<"lifetime '%0' is declared more than once">,
+      InGroup<LifetimeSafetyNamedLifetimes>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_repeated_lifetime_params
+    : Warning<"repeated LIFETIME_PARAMS annotation; the declared lifetimes are "
+              "concatenated with those of the earlier annotation">,
+      InGroup<LifetimeSafetyNamedLifetimes>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_non_literal_lifetime
+    : Warning<"lifetime annotation argument is not a string literal and is "
+              "ignored">,
+      InGroup<LifetimeSafetyNamedLifetimes>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_conflicting_lifetime_signature
+    : Warning<"lifetime annotations on this declaration differ from those on a "
+              "previous declaration; annotations written on types are not "
+              "merged across declarations">,
+      InGroup<LifetimeSafetyNamedLifetimes>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_named_lifetime_violation
+    : Warning<"returning a value borrowed from lifetime '%0', but the return "
+              "type declares lifetime '%1'">,
+      InGroup<LifetimeSafetyNamedLifetimeViolation>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_static_return_violation
+    : Warning<"returning a value borrowed from this function's caller, but the "
+              "return type declares lifetime 'static'">,
+      InGroup<LifetimeSafetyNamedLifetimeViolation>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_static_argument_violation
+    : Warning<"argument is not known to live forever, but "
+              "%select{parameter '%1'|the implicit object parameter}0 declares "
+              "lifetime 'static'">,
+      InGroup<LifetimeSafetyNamedLifetimeViolation>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_reserved_lifetime_param
+    : Warning<"'%0' is a distinguished lifetime and cannot be introduced as a "
+              "parameter">,
+      InGroup<LifetimeSafetyNamedLifetimes>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_lifetimebound_distinguished_conflict
+    : Warning<"'lifetimebound' says the result may borrow from "
+              "%select{this parameter|the implicit object parameter}0, but the "
+              "return type declares lifetime '%1', which does not borrow from "
+              "the parameters">,
+      InGroup<LifetimeSafetyLifetimeboundConflict>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_lifetimebound_lifetime_conflict
+    : Warning<"'lifetimebound' says the result may borrow from "
+              "%select{this parameter|the implicit object parameter}0, but it "
+              "declares lifetime '%1' while the return type declares "
+              "lifetime '%2'">,
+      InGroup<LifetimeSafetyLifetimeboundConflict>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_missing_lifetimebound
+    : Warning<"%select{parameter|the implicit object parameter}0 shares "
+              "lifetime '%1' with the return type but is not marked "
+              "'lifetimebound'; tools that only read 'lifetimebound' will not "
+              "see the relationship">,
+      InGroup<LifetimeSafetyNamedLifetimeSuggestions>,
+      DefaultIgnore;
+
+def note_lifetime_safety_lifetime_declared_here
+    : Note<"lifetime '%0' declared here">;
+def note_lifetime_safety_return_lifetime_here
+    : Note<"return type declares lifetime '%0' here">;
+def note_lifetime_safety_static_param_here
+    : Note<"parameter declares lifetime 'static' here">;
+def note_lifetime_safety_previous_lifetime_params
+    : Note<"previous LIFETIME_PARAMS annotation is here">;
+def note_lifetime_safety_previous_lifetime_signature
+    : Note<"previous declaration is here">;
+// Reports the outlives bound that would make a rejected return well-typed.
+// The bound cannot currently be written; the note exists to explain the
+// rejection and to measure how often real code wants one.
+def note_lifetime_safety_outlives_bound_would_help
+    : Note<"this would be allowed if lifetime '%0' were declared to outlive "
+           "lifetime '%1', which cannot currently be expressed">;
+
 def note_lifetime_safety_used_here : Note<"later used here">;
 def note_lifetime_safety_invalidated_here : Note<"%0 is invalidated here">;
 def note_lifetime_safety_destroyed_here : Note<"%0 is destroyed here">;
