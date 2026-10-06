@@ -205,3 +205,160 @@ void fresh_lifetime_flows_nothing() {
   }
   use(*r);
 }
+
+//===----------------------------------------------------------------------===//
+// Structs with LIFETIME_PARAMS
+//===----------------------------------------------------------------------===//
+
+#define $2(l1, l2) [[clang::annotate_type("lifetime", #l1, #l2)]]
+
+struct LIFETIME_PARAMS("a") SV {};
+using SVA = SV;
+struct LIFETIME_PARAMS("a", "b") Pair {};
+
+void use_sv(SV);
+
+LIFETIME_PARAMS("a")
+SV $a make_sv(int* $a p);
+
+LIFETIME_PARAMS("a", "b")
+SV $a pick_sv(SV $a x, SV $b y);
+
+LIFETIME_PARAMS("a", "b")
+Pair $2(a, b) make_pair(int* $a x, int* $b y);
+
+LIFETIME_PARAMS("a", "b")
+int* $a pair_first(Pair $2(a, b) p);
+
+LIFETIME_PARAMS("a", "b")
+int* $b pair_second(Pair $2(a, b) p);
+
+void sv_unrelated_dies(SV keep) {
+  SV r;
+  {
+    int local = 0;
+    r = pick_sv(keep, make_sv(&local));
+  }
+  use_sv(r);
+}
+
+void sv_matching_dies(SV other) {
+  SV r;
+  {
+    int local = 0;
+    r = pick_sv(make_sv(&local), other); // expected-warning {{local variable 'local' does not live long enough}}
+                                         // expected-note@-1 {{result of call to 'pick_sv' aliases the storage of local variable 'local'}}
+                                         // expected-note@-2 {{result of call to 'make_sv' aliases the storage of local variable 'local'}}
+  } // expected-note {{local variable 'local' is destroyed here}}
+  use_sv(r); // expected-note {{later used here}}
+}
+
+void pair_slots_flow_independently(int* keep) {
+  int* r1;
+  {
+    int local = 0;
+    Pair p = make_pair(keep, &local);
+    r1 = pair_first(p);
+  }
+  use(*r1);
+
+  int* r2;
+  {
+    int local = 0;
+    Pair p = make_pair(keep, &local); // expected-warning {{local variable 'local' does not live long enough}}
+                                      // expected-note@-1 {{result of call to 'make_pair' aliases the storage of local variable 'local'}}
+    r2 = pair_second(p); // expected-note {{local variable 'p' aliases the storage of local variable 'local'}}
+                         // expected-note@-1 {{result of call to 'pair_second' aliases the storage of local variable 'local'}}
+  } // expected-note {{local variable 'local' is destroyed here}}
+  use(*r2); // expected-note {{later used here}}
+}
+
+struct LIFETIME_PARAMS("a", "b") PairWithFields {
+  int* $a first;
+  int* $b second;
+
+  int* $a get_first() { return first; }
+  int* $b get_second() { return second; }
+};
+
+LIFETIME_PARAMS("a", "b")
+PairWithFields $2(a, b) make_pair_with_fields(int* $a x, int* $b y);
+
+void pair_fields_and_methods(int* keep) {
+  int* r1;
+  {
+    int local = 0;
+    PairWithFields p = make_pair_with_fields(keep, &local);
+    r1 = p.first;
+  }
+  use(*r1);
+
+  int* r2;
+  {
+    int local = 0;
+    PairWithFields p = make_pair_with_fields(keep, &local); // expected-warning {{local variable 'local' does not live long enough}}
+                                                            // expected-note@-1 {{result of call to 'make_pair_with_fields' aliases the storage of local variable 'local'}}
+    r2 = p.second;
+  } // expected-note {{local variable 'local' is destroyed here}}
+  use(*r2); // expected-note {{later used here}}
+
+  int* m1;
+  {
+    int local = 0;
+    PairWithFields p = make_pair_with_fields(keep, &local);
+    m1 = p.get_first();
+  }
+  use(*m1);
+
+  int* m2;
+  {
+    int local = 0;
+    PairWithFields p = make_pair_with_fields(keep, &local); // expected-warning {{local variable 'local' does not live long enough}}
+                                                            // expected-note@-1 {{result of call to 'make_pair_with_fields' aliases the storage of local variable 'local'}}
+    m2 = p.get_second(); // expected-note {{result of call to 'get_second' aliases the storage of local variable 'local'}}
+  } // expected-note {{local variable 'local' is destroyed here}}
+  use(*m2); // expected-note {{later used here}}
+}
+
+struct LIFETIME_PARAMS("a", "b") CtorPair {
+  int* $a first;
+  int* $b second;
+  CtorPair(int* $a f, int* $b s) : first(f), second(s) {}
+};
+
+void pair_ctor_and_agg_init(int* keep) {
+  int* c1;
+  {
+    int local = 0;
+    CtorPair p(keep, &local);
+    c1 = p.first;
+  }
+  use(*c1);
+
+  int* c2;
+  {
+    int local = 0;
+    CtorPair p(keep, &local); // expected-warning {{local variable 'local' does not live long enough}}
+    c2 = p.second;
+  } // expected-note {{local variable 'local' is destroyed here}}
+  use(*c2); // expected-note {{later used here}}
+
+  int* a1;
+  {
+    int local = 0;
+    PairWithFields p{keep, &local};
+    a1 = p.first;
+  }
+  use(*a1);
+
+  int* a2;
+  {
+    int local = 0;
+    PairWithFields p{keep, &local}; // expected-warning {{local variable 'local' does not live long enough}}
+    a2 = p.second;
+  } // expected-note {{local variable 'local' is destroyed here}}
+  use(*a2); // expected-note {{later used here}}
+}
+
+
+

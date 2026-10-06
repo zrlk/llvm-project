@@ -173,3 +173,37 @@ struct T {
 
 // A `$static` return with no `lifetimebound` anywhere is unremarkable.
 int* $static unbound(int* p) { return &g; }
+
+//===----------------------------------------------------------------------===//
+// Structs with LIFETIME_PARAMS
+//===----------------------------------------------------------------------===//
+
+struct LIFETIME_PARAMS("a") SV {};
+
+LIFETIME_PARAMS("a")
+SV $a make_sv(int* $a p);
+
+void sink_sv(SV $static s); // viol-note 2 {{parameter declares lifetime 'static' here}}
+
+SV $static sv_from_static(SV $static s) { return s; }
+
+LIFETIME_PARAMS("a")
+SV $a sv_from_static_to_named(SV $static s) { return s; }
+
+LIFETIME_PARAMS("a")
+SV $static sv_from_named(SV $a s) {
+  return s; // viol-warning {{returning a value borrowed from this function's caller, but the return type declares lifetime 'static'}}
+}
+
+void sv_pass_static(SV $static s) { sink_sv(s); }
+
+LIFETIME_PARAMS("a")
+void sv_pass_named(SV $a s) {
+  sink_sv(s); // viol-warning {{argument is not known to live forever, but parameter 's' declares lifetime 'static'}}
+}
+
+void sv_pass_local() {
+  int x = 0;
+  sink_sv(make_sv(&x)); // viol-warning {{argument is not known to live forever, but parameter 's' declares lifetime 'static'}}
+}
+

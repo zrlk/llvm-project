@@ -144,6 +144,10 @@ bool OriginManager::hasOrigins(QualType QT, bool IntrinsicOnly) const {
   const auto *RD = QT->getAsCXXRecordDecl();
   if (!RD)
     return false;
+  // A class that declares lifetime parameters carries one origin per parameter.
+  if (const CXXRecordDecl *Def = RD->getDefinition();
+      Def && !getDeclaredLifetimeParams(AST, Def).empty())
+    return true;
   // Standard library callable wrappers (e.g., std::function) can propagate the
   // stored lambda's origins.
   if (isStdCallableWrapperType(RD))
@@ -243,6 +247,19 @@ OriginList *OriginManager::buildListForType(QualType QT, const T *Node,
     // level in the origin tree. E.g., for T*& / View&.
     if (hasOrigins(PointeeTy))
       Head->setInnerOriginList(buildListForType(PointeeTy, Node));
+  } else if (const auto *RD = QT->getAsCXXRecordDecl()) {
+    // A class with N declared lifetime parameters contributes N consecutive
+    // entries to the flat list so that it zips positionally with
+    // getExplicitLifetimes.
+    if (const CXXRecordDecl *Def = RD->getDefinition()) {
+      unsigned NumSlots = getDeclaredLifetimeParams(AST, Def).size();
+      OriginList *Tail = Head;
+      for (unsigned I = 1; I < NumSlots; ++I) {
+        OriginList *Next = createNode(Node, QT);
+        Tail->setInnerOriginList(Next);
+        Tail = Next;
+      }
+    }
   }
   return Head;
 }

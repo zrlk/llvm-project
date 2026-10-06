@@ -141,3 +141,68 @@ int& reuse_int(int& x, int& y) { return dependent(x, y); }
 template <typename T>
 LIFETIME_PARAMS("a", "b")
 T& $a never_instantiated(T& $a x, T& $b y) { return y; }
+
+//===----------------------------------------------------------------------===//
+// Structs with LIFETIME_PARAMS
+//===----------------------------------------------------------------------===//
+
+#define $2(l1, l2) [[clang::annotate_type("lifetime", #l1, #l2)]]
+
+struct LIFETIME_PARAMS("a") SV {};
+using SVA = SV;
+struct LIFETIME_PARAMS("a", "b") Pair {};
+
+LIFETIME_PARAMS("a", "b")
+SV $a sv_ok(SV $a x, SV $b y) { return x; }
+
+LIFETIME_PARAMS("a", "b")
+SV $a sv_bad(SV $a x, SV $b y) {
+  return y; // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+}
+
+LIFETIME_PARAMS("a", "b")
+SVA $a sva_bad(SVA $a x, SVA $b y) {
+  return y; // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+}
+
+LIFETIME_PARAMS("a", "b")
+Pair $2(a, b) pair_ok(Pair $2(a, b) p) { return p; }
+
+LIFETIME_PARAMS("a", "b")
+Pair $2(a, b) pair_bad_first(Pair $2(b, b) p) {
+  return p; // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+}
+
+LIFETIME_PARAMS("a", "b")
+Pair $2(a, b) pair_bad_second(Pair $2(a, a) p) {
+  return p; // expected-warning {{returning a value borrowed from lifetime 'a', but the return type declares lifetime 'b'}} // expected-note {{this would be allowed if lifetime 'a' were declared to outlive lifetime 'b', which cannot currently be expressed}}
+}
+
+struct LIFETIME_PARAMS("a", "b") PairWithFields {
+  int* $a first;
+  int* $b second;
+
+  int* $a get_first_ok() { return first; }
+  int* $b get_second_ok() { return second; }
+
+  int* $a get_first_bad() {
+    return second; // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+  }
+
+  LIFETIME_PARAMS("c")
+  int* $a get_or_other_bad(int* $c other, bool cond) {
+    if (cond)
+      return first;
+    return other; // expected-warning {{returning a value borrowed from lifetime 'c', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'c' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+  }
+};
+
+LIFETIME_PARAMS("a", "b")
+int* $a read_first_ok(PairWithFields $2(a, b) p) { return p.first; }
+
+LIFETIME_PARAMS("a", "b")
+int* $a read_second_bad(PairWithFields $2(a, b) p) {
+  return p.second; // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+}
+
+

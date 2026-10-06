@@ -257,18 +257,59 @@ void FactsGenerator::VisitCXXMemberCallExpr(const CXXMemberCallExpr *MCE) {
 }
 
 void FactsGenerator::VisitMemberExpr(const MemberExpr *ME) {
-  auto *MD = ME->getMemberDecl();
-  if (isa<FieldDecl>(MD) && doesDeclHaveStorage(MD)) {
+  auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
+  if (!FD)
+    return;
+
+  OriginList *Dst = getOriginsList(*ME);
+  const Expr *Base = ME->getBase();
+  OriginList *Src = getOriginsList(*Base);
+
+  if (doesDeclHaveStorage(FD)) {
     assert(ME->isGLValue() && "Field member should be GL value");
-    OriginList *Dst = getOriginsList(*ME);
     assert(Dst && "Field member should have an origin list as it is GL value");
-    OriginList *Src = getOriginsList(*ME->getBase());
     assert(Src && "Base expression should be a pointer/reference type");
     // The field's glvalue (outermost origin) holds the same loans as the base
     // expression.
     CurrentBlockFacts.push_back(FactMgr.createFact<OriginFlowFact>(
         Dst->getOuterOriginID(), Src->getOuterOriginID(),
         /*Kill=*/true));
+  }
+
+  // When accessing a field on a record with LIFETIME_PARAMS (other than through
+  // `this`, whose fields share origins with the FieldDecl and receive their
+  // named placeholder loans at function entry), substitute the base object's
+  // lifetime-parameter origins into the field's corresponding annotated slots.
+  if (!isa<CXXThisExpr>(Base->IgnoreParenImpCasts()) && Dst && Src) {
+    ASTContext &Ctx = AC.getASTContext();
+    LifetimeList FieldLifetimes = getExplicitLifetimes(Ctx, FD->getType());
+    if (!FieldLifetimes.empty()) {
+      const RecordDecl *RD = FD->getParent();
+      LifetimeList ClassParams = getDeclaredLifetimeParams(Ctx, RD);
+      OriginList *BaseParams =
+          ME->isArrow() || Base->isGLValue() ? Src->peelOuterOrigin() : Src;
+      OriginList *FieldValue =
+          doesDeclHaveStorage(FD) ? Dst->peelOuterOrigin() : Dst;
+      for (const LifetimeVar &LV : FieldLifetimes) {
+        if (!FieldValue)
+          break;
+        if (LV.getKind() == LifetimeVar::Kind::Named) {
+          OriginList *Slot = BaseParams;
+          for (const LifetimeVar &Param : ClassParams) {
+            if (!Slot)
+              break;
+            if (Param.getName() == LV.getName()) {
+              CurrentBlockFacts.push_back(FactMgr.createFact<OriginFlowFact>(
+                  FieldValue->getOuterOriginID(), Slot->getOuterOriginID(),
+                  /*Kill=*/true));
+              break;
+            }
+            Slot = Slot->peelOuterOrigin();
+          }
+        }
+        FieldValue = FieldValue->peelOuterOrigin();
+      }
+    }
   }
 }
 
@@ -599,6 +640,49 @@ void FactsGenerator::VisitCXXFunctionalCastExpr(
 void FactsGenerator::VisitInitListExpr(const InitListExpr *ILE) {
   if (!hasOrigins(ILE))
     return;
+  if (const auto *RD = ILE->getType()->getAsCXXRecordDecl()) {
+    if (const CXXRecordDecl *Def = RD->getDefinition()) {
+      ASTContext &Ctx = AC.getASTContext();
+      LifetimeList ClassParams = getDeclaredLifetimeParams(Ctx, Def);
+      if (!ClassParams.empty()) {
+        llvm::SmallDenseMap<llvm::StringRef, llvm::SmallVector<OriginID, 2>, 4>
+            ByLifetime;
+        unsigned InitIdx = 0;
+        for (const FieldDecl *Field : Def->fields()) {
+          if (InitIdx >= ILE->getNumInits())
+            break;
+          const Expr *Init = ILE->getInit(InitIdx++);
+          if (!Init)
+            continue;
+          LifetimeList FieldLifetimes =
+              getExplicitLifetimes(Ctx, Field->getType());
+          if (FieldLifetimes.empty())
+            continue;
+          OriginList *InitList = getOriginsList(*Init);
+          for (const LifetimeVar &LV : FieldLifetimes) {
+            if (!InitList)
+              break;
+            if (LV.getKind() == LifetimeVar::Kind::Named)
+              ByLifetime[LV.getName()].push_back(InitList->getOuterOriginID());
+            InitList = InitList->peelOuterOrigin();
+          }
+        }
+        OriginList *ResultLevel = getOriginsList(*ILE);
+        for (const LifetimeVar &Param : ClassParams) {
+          if (!ResultLevel)
+            break;
+          bool KillSrc = true;
+          for (OriginID Src : ByLifetime.lookup(Param.getName())) {
+            CurrentBlockFacts.push_back(FactMgr.createFact<OriginFlowFact>(
+                ResultLevel->getOuterOriginID(), Src, KillSrc));
+            KillSrc = false;
+          }
+          ResultLevel = ResultLevel->peelOuterOrigin();
+        }
+        return;
+      }
+    }
+  }
   // For list initialization with a single element, like `View{...}`, the
   // origin of the list itself is the origin of its single element.
   if (ILE->getNumInits() == 1) {
@@ -1360,13 +1444,42 @@ llvm::SmallVector<Fact *> FactsGenerator::issuePlaceholderLoans() {
 
   if (auto ThisOrigins = FactMgr.getOriginMgr().getThisOrigins()) {
     OriginList *List = *ThisOrigins;
-    const Loan *L =
-        FactMgr.getLoanMgr().createPlaceholderLoan(cast<CXXMethodDecl>(FD));
+    const auto *MD = cast<CXXMethodDecl>(FD);
+    const Loan *L = FactMgr.getLoanMgr().createPlaceholderLoan(MD);
     PlaceholderLoanFacts.push_back(
         FactMgr.createFact<IssueFact>(L->getID(), List->getOuterOriginID()));
     // Lifetimes written after the parameter list belong to the implicit
-    // object parameter, which is the position `lifetimebound` uses for it.
+    // object parameter (and for a class with `LIFETIME_PARAMS`, its inner
+    // levels carry the class's lifetime parameters).
     issueNamedLoans(Sig.FunctionType, List);
+
+    if (const CXXRecordDecl *RD = MD->getParent()->getDefinition()) {
+      ASTContext &Ctx = AC.getASTContext();
+      // If the method had no signature of its own, `Sig.FunctionType` is empty,
+      // so issue the enclosing class's lifetime parameters onto the inner
+      // levels of `ThisOrigins` directly.
+      if (Sig.FunctionType.empty()) {
+        LifetimeList ClassParams = getDeclaredLifetimeParams(Ctx, RD);
+        if (!ClassParams.empty())
+          issueNamedLoans(ClassParams, List->peelOuterOrigin());
+      }
+
+      // `this->field` shares origins with the `FieldDecl`, so issue any named
+      // loans written on the field's type directly onto the field's origins.
+      // Constructors initialize the fields rather than reading them from an
+      // already-constructed object, so skip issuing pre-existing field loans
+      // there.
+      if (!isa<CXXConstructorDecl>(MD)) {
+        for (const FieldDecl *Field : RD->fields()) {
+          LifetimeList FieldLifetimes =
+              getExplicitLifetimes(Ctx, Field->getType());
+          if (FieldLifetimes.empty())
+            continue;
+          if (OriginList *FieldList = getOriginsList(*Field))
+            issueNamedLoans(FieldLifetimes, FieldList);
+        }
+      }
+    }
   }
 
   unsigned ParamIdx = 0;

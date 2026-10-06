@@ -789,6 +789,34 @@ LifetimeSignature getLifetimeSignature(const ASTContext &Ctx,
   } else {
     Sig.Params.resize(FD->getNumParams());
   }
+
+  // On a member function that carries lifetime annotations, lifetime
+  // parameters declared on the enclosing class are in scope and occupy the
+  // inner levels of the implicit object parameter (`Class *`).
+  if (!Sig.empty()) {
+    if (const auto *MD = dyn_cast<CXXMethodDecl>(FD)) {
+      if (const CXXRecordDecl *RD = MD->getParent()->getDefinition()) {
+        LifetimeList ClassParams = getDeclaredLifetimeParams(Ctx, RD);
+        if (!ClassParams.empty()) {
+          for (const LifetimeVar &LV : Sig.Declared)
+            if (!llvm::is_contained(ClassParams, LV))
+              ClassParams.push_back(LV);
+          Sig.Declared = std::move(ClassParams);
+
+          if (isa<CXXConstructorDecl>(FD) && Sig.Return.empty()) {
+            Sig.Return = getDeclaredLifetimeParams(Ctx, RD);
+          } else if (MD->isInstance() && !isa<CXXConstructorDecl>(FD) &&
+                     Sig.FunctionType.size() <= 1) {
+            if (Sig.FunctionType.empty())
+              Sig.FunctionType.push_back(LifetimeVar::elided());
+            LifetimeList OwnClassParams = getDeclaredLifetimeParams(Ctx, RD);
+            Sig.FunctionType.append(OwnClassParams.begin(),
+                                    OwnClassParams.end());
+          }
+        }
+      }
+    }
+  }
   return Sig;
 }
 

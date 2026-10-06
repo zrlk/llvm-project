@@ -38,6 +38,7 @@ public:
       // uses them. Each name needs its own alias: `$a` alone is a parse error,
       // it has to expand from a macro of that name.
       #define $(l) [[clang::annotate_type("lifetime", #l)]]
+      #define $2(l1, l2) [[clang::annotate_type("lifetime", #l1, #l2)]]
       #define LIFETIME_PARAMS(...) \
           [[clang::annotate("lifetime_params", __VA_ARGS__)]]
       #define $a $(a)
@@ -376,10 +377,12 @@ public:
 // It holds the name of the origin variable and a reference to the helper.
 class OriginInfo {
 public:
-  OriginInfo(llvm::StringRef OriginVar, LifetimeTestHelper &Helper)
-      : OriginVar(OriginVar), Helper(Helper) {}
+  OriginInfo(llvm::StringRef OriginVar, LifetimeTestHelper &Helper,
+             unsigned Level = 0)
+      : OriginVar(OriginVar), Helper(Helper), Level(Level) {}
   llvm::StringRef OriginVar;
   LifetimeTestHelper &Helper;
+  unsigned Level;
 };
 
 /// Names one loan an origin is expected to hold.
@@ -420,7 +423,8 @@ public:
 /// POINT()) where the check should be performed.
 MATCHER_P2(HasLoansToImpl, LoanVars, Annotation, "") {
   const OriginInfo &Info = arg;
-  std::optional<OriginID> OIDOpt = Info.Helper.getOriginForDecl(Info.OriginVar);
+  std::optional<OriginID> OIDOpt =
+      Info.Helper.getOriginForDeclAtLevel(Info.OriginVar, Info.Level);
   if (!OIDOpt) {
     *result_listener << "could not find origin for '" << Info.OriginVar.str()
                      << "'";
@@ -493,7 +497,8 @@ MATCHER_P2(HoldsExactlyImpl, Expected, Annotation, "") {
   const OriginInfo &Info = arg;
   auto &Helper = Info.Helper;
 
-  std::optional<OriginID> OIDOpt = Helper.getOriginForDecl(Info.OriginVar);
+  std::optional<OriginID> OIDOpt =
+      Helper.getOriginForDeclAtLevel(Info.OriginVar, Info.Level);
   if (!OIDOpt) {
     *result_listener << "could not find origin for '" << Info.OriginVar.str()
                      << "'";
@@ -711,8 +716,8 @@ protected:
     Helper = std::make_unique<LifetimeTestHelper>(*Runner);
   }
 
-  OriginInfo Origin(llvm::StringRef OriginVar) {
-    return OriginInfo(OriginVar, *Helper);
+  OriginInfo Origin(llvm::StringRef OriginVar, unsigned Level = 0) {
+    return OriginInfo(OriginVar, *Helper, Level);
   }
 
   /// Factory function that hides the std::vector creation.
@@ -2726,6 +2731,138 @@ TEST_F(LifetimeAnalysisTest, NoObligationWithoutAStaticParameter) {
     }
   )");
   EXPECT_THAT(Helper->getStaticObligationLoans(), SizeIs(0));
+}
+
+TEST_F(LifetimeAnalysisTest, RecordWithLifetimeParamCarriesNamedLoan) {
+  SetupTest(R"(
+    struct LIFETIME_PARAMS("a") SV {};
+    using SVA = SV;
+    LIFETIME_PARAMS("a", "b")
+    void target(SV $a s, SVA $b sa) {
+      SV us = s;
+      SVA usa = sa;
+      POINT(entry);
+    }
+  )");
+  EXPECT_THAT(Origin("us"),
+              HoldsExactly({ParamLoan("s"), LifetimeLoan("a")}, "entry"));
+  EXPECT_THAT(Origin("usa"),
+              HoldsExactly({ParamLoan("sa"), LifetimeLoan("b")}, "entry"));
+}
+
+TEST_F(LifetimeAnalysisTest,
+       RecordWithMultipleLifetimeParamsCarriesOneOriginPerSlot) {
+  SetupTest(R"(
+    struct LIFETIME_PARAMS("a", "b") Pair {};
+    LIFETIME_PARAMS("a", "b")
+    void target(Pair $2(a, b) p) {
+      Pair u = p;
+      POINT(entry);
+    }
+  )");
+  // A parameter gets its ordinary placeholder loan at level 0 only; the named
+  // loans zip positionally across all declared lifetime slots of the record.
+  EXPECT_THAT(Origin("u", 0),
+              HoldsExactly({ParamLoan("p"), LifetimeLoan("a")}, "entry"));
+  EXPECT_THAT(Origin("u", 1), HoldsExactly({LifetimeLoan("b")}, "entry"));
+}
+
+TEST_F(LifetimeAnalysisTest, RecordCallSubstitutionFlowsPerSlot) {
+  SetupTest(R"(
+    struct LIFETIME_PARAMS("a", "b") Pair {};
+    LIFETIME_PARAMS("a", "b")
+    Pair $2(a, b) make_pair(int* $a x, int* $b y);
+    LIFETIME_PARAMS("a", "b")
+    int* $a first(Pair $2(a, b) p);
+    LIFETIME_PARAMS("a", "b")
+    int* $b second(Pair $2(a, b) p);
+
+    void target() {
+      int x, y;
+      Pair p = make_pair(&x, &y);
+      int* r1 = first(p);
+      int* r2 = second(p);
+      POINT(after);
+    }
+  )");
+  EXPECT_THAT(Origin("p", 0), HoldsExactly({VarLoan("x")}, "after"));
+  EXPECT_THAT(Origin("p", 1), HoldsExactly({VarLoan("y")}, "after"));
+  EXPECT_THAT(Origin("r1"), HoldsExactly({VarLoan("x")}, "after"));
+  EXPECT_THAT(Origin("r2"), HoldsExactly({VarLoan("y")}, "after"));
+}
+
+TEST_F(LifetimeAnalysisTest, RecordFieldCarriesNamedLoanInMethod) {
+  SetupTest(R"(
+    struct LIFETIME_PARAMS("a", "b") Pair {
+      int* $a first;
+      int* $b second;
+      void target() {
+        int* f = first;
+        int* s = second;
+        POINT(entry);
+      }
+    };
+  )");
+  EXPECT_THAT(Origin("f"), HoldsExactly({LifetimeLoan("a")}, "entry"));
+  EXPECT_THAT(Origin("s"), HoldsExactly({LifetimeLoan("b")}, "entry"));
+}
+
+TEST_F(LifetimeAnalysisTest, RecordMemberAccessFlowsPerSlot) {
+  SetupTest(R"(
+    struct LIFETIME_PARAMS("a", "b") Pair {
+      int* $a first;
+      int* $b second;
+    };
+    LIFETIME_PARAMS("a", "b")
+    Pair $2(a, b) make_pair(int* $a x, int* $b y);
+
+    void target() {
+      int x, y, x2, y2;
+      Pair p = make_pair(&x, &y);
+      int* r1 = p.first;
+      int* r2 = p.second;
+      int* pr1 = (&p)->first;
+      int* pr2 = make_pair(&x2, &y2).second;
+      POINT(after);
+    }
+  )");
+  EXPECT_THAT(Origin("r1"), HoldsExactly({VarLoan("x")}, "after"));
+  EXPECT_THAT(Origin("r2"), HoldsExactly({VarLoan("y")}, "after"));
+  EXPECT_THAT(Origin("pr1"), HoldsExactly({VarLoan("x")}, "after"));
+  EXPECT_THAT(Origin("pr2"), HoldsExactly({VarLoan("y2")}, "after"));
+}
+
+TEST_F(LifetimeAnalysisTest, RecordConstructorAndAggregateInitFlowPerSlot) {
+  SetupTest(R"(
+    struct LIFETIME_PARAMS("a", "b") CtorPair {
+      int* $a first;
+      int* $b second;
+      CtorPair(int* $a f, int* $b s) : first(f), second(s) {}
+    };
+    struct LIFETIME_PARAMS("a", "b") AggPair {
+      int* $a first;
+      int* $b second;
+    };
+
+    void target() {
+      int x1, y1, x2, y2;
+      CtorPair cp(&x1, &y1);
+      AggPair ap{&x2, &y2};
+      int* cr1 = cp.first;
+      int* cr2 = cp.second;
+      int* ar1 = ap.first;
+      int* ar2 = ap.second;
+      POINT(after);
+    }
+  )");
+  EXPECT_THAT(Origin("cp", 0), HoldsExactly({VarLoan("x1")}, "after"));
+  EXPECT_THAT(Origin("cp", 1), HoldsExactly({VarLoan("y1")}, "after"));
+  EXPECT_THAT(Origin("ap", 0), HoldsExactly({VarLoan("x2")}, "after"));
+  EXPECT_THAT(Origin("ap", 1), HoldsExactly({VarLoan("y2")}, "after"));
+  EXPECT_THAT(Origin("cr1"), HoldsExactly({VarLoan("x1")}, "after"));
+  EXPECT_THAT(Origin("cr2"), HoldsExactly({VarLoan("y1")}, "after"));
+  EXPECT_THAT(Origin("ar1"), HoldsExactly({VarLoan("x2")}, "after"));
+  EXPECT_THAT(Origin("ar2"), HoldsExactly({VarLoan("y2")}, "after"));
 }
 
 } // anonymous namespace

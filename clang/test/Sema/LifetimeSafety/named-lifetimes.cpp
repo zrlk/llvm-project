@@ -99,6 +99,15 @@ LIFETIME_PARAMS("a")
 // expected-warning@+1 {{type 'Owner' takes no lifetime annotations, but 1 was written}}
 void takes_owner(Owner $a o) {}
 
+// A class's declared lifetime parameters are in scope inside its member
+// functions, while undeclared names are still diagnosed.
+struct LIFETIME_PARAMS("a") RefWithMethods {
+  int* $a p;
+  int* $a get_ok() { return p; }
+  // undeclared-warning@+1 {{lifetime 'b' is not declared by this function}}
+  int* $b get_undeclared() { return p; }
+};
+
 //===----------------------------------------------------------------------===//
 // Placement
 //===----------------------------------------------------------------------===//

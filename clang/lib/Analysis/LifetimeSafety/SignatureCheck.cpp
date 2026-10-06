@@ -28,6 +28,12 @@ public:
   /// Collects the lifetimes introduced by \p FD, reporting any that are
   /// introduced more than once.
   void collectDeclared(const FunctionDecl *FD) {
+    if (const auto *MD = dyn_cast<CXXMethodDecl>(FD))
+      if (const CXXRecordDecl *RD = MD->getParent()->getDefinition())
+        for (const LifetimeVar &LV : getDeclaredLifetimeParams(Ctx, RD))
+          if (LV.getKind() == LifetimeVar::Kind::Named)
+            InScope.insert(LV.getName());
+
     DeclaredLifetimes Declared = getDeclaredLifetimes(Ctx, FD);
 
     if (Declared.NonLiteralArgLoc.isValid())

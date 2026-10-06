@@ -64,8 +64,10 @@ private:
   llvm::DenseMap<const ParmVarDecl *, EscapingTarget> NoescapeWarningsMap;
   llvm::DenseSet<const Decl *> VerifiedLiftimeboundEscapes;
   /// Returns whose value borrows from a lifetime other than the one the return
-  /// type declares, keyed by the return expression.
-  llvm::MapVector<const Expr *, llvm::StringRef> LifetimeViolations;
+  /// type declares, keyed by the return expression and mapped to (Found,
+  /// Required).
+  llvm::MapVector<const Expr *, std::pair<llvm::StringRef, llvm::StringRef>>
+      LifetimeViolations;
   /// Returns whose value borrows from caller storage that a `$static` return
   /// type does not accept.
   llvm::SetVector<const Expr *> StaticReturnViolations;
@@ -73,12 +75,9 @@ private:
   /// to the parameter that imposed the obligation (null for the implicit
   /// object argument).
   llvm::MapVector<const Expr *, const ParmVarDecl *> StaticArgumentViolations;
-  /// The lifetime declared on the outermost level of the return type, if any.
-  llvm::StringRef RequiredReturnLifetime;
-  /// The kind of the lifetime declared on the outermost level of the return
-  /// type. `Named` is accompanied by `RequiredReturnLifetime`; the
-  /// distinguished kinds are checked differently and carry no name.
-  LifetimeVar::Kind ReturnLifetimeKind = LifetimeVar::Kind::Elided;
+  /// The lifetimes declared on the return type, ordered outermost-first so
+  /// they zip positionally with the returned expression's `OriginList`.
+  LifetimeList ReturnLifetimes;
   /// The outermost lifetime kind written on each parameter, plus the implicit
   /// object parameter keyed by its method.
   ///
@@ -124,13 +123,7 @@ public:
         LSOpts(LSOpts) {
     if (const auto *Fn = dyn_cast_if_present<FunctionDecl>(FD)) {
       LifetimeSignature Sig = getLifetimeSignature(AST, Fn);
-      // Only the outermost level of the return is checked; distributing the
-      // inner levels is future work.
-      if (!Sig.Return.empty()) {
-        ReturnLifetimeKind = Sig.Return.front().getKind();
-        if (ReturnLifetimeKind == LifetimeVar::Kind::Named)
-          RequiredReturnLifetime = Sig.Return.front().getName();
-      }
+      ReturnLifetimes = std::move(Sig.Return);
       for (unsigned I = 0, E = Fn->getNumParams(); I != E; ++I)
         if (I < Sig.Params.size() && !Sig.Params[I].empty())
           ParamLifetimeKinds[Fn->getParamDecl(I)] =
@@ -219,16 +212,21 @@ public:
           AnnotationWarningsMap.try_emplace(MD, ReturnEsc->getReturnExpr());
       }
     };
+    const auto *ReturnEsc = dyn_cast<ReturnEscapeFact>(OEF);
+    std::optional<LifetimeVar> ReturnLifetime =
+        getReturnLifetimeForOrigin(ReturnEsc);
     auto CheckNamedLifetime = [&](const NamedLifetime *NL) {
       // The contract only constrains what is returned.
-      const auto *ReturnEsc = dyn_cast<ReturnEscapeFact>(OEF);
-      if (!ReturnEsc || RequiredReturnLifetime.empty())
+      if (!ReturnLifetime ||
+          ReturnLifetime->getKind() != LifetimeVar::Kind::Named)
         return;
-      if (NL->getName() == RequiredReturnLifetime)
+      if (NL->getName() == ReturnLifetime->getName())
         return;
       // With no outlives relation between lifetimes, the acceptance set for
       // `$a` is exactly `{$a}`.
-      LifetimeViolations.try_emplace(ReturnEsc->getReturnExpr(), NL->getName());
+      LifetimeViolations.try_emplace(
+          ReturnEsc->getReturnExpr(),
+          std::make_pair(NL->getName(), ReturnLifetime->getName()));
     };
     // A `$static` return promises storage that never expires, which nothing
     // the caller passes in provides -- unless the caller was itself told to
@@ -236,10 +234,8 @@ public:
     // from, or null for a loan minted from a named lifetime, which is
     // caller-scoped by construction.
     auto CheckStaticReturn = [&](const Decl *Source) {
-      if (ReturnLifetimeKind != LifetimeVar::Kind::Static)
-        return;
-      const auto *ReturnEsc = dyn_cast<ReturnEscapeFact>(OEF);
-      if (!ReturnEsc)
+      if (!ReturnLifetime ||
+          ReturnLifetime->getKind() != LifetimeVar::Kind::Static)
         return;
       if (Source && declaresStaticSafeLifetime(Source))
         return;
@@ -262,6 +258,25 @@ public:
         CheckStaticReturn(/*Source=*/nullptr);
       }
     }
+  }
+
+  /// Finds the return lifetime corresponding to the origin escaping in
+  /// \p ReturnEsc by walking the return expression's `OriginList` in lockstep
+  /// with `ReturnLifetimes`.
+  std::optional<LifetimeVar>
+  getReturnLifetimeForOrigin(const ReturnEscapeFact *ReturnEsc) const {
+    if (!ReturnEsc)
+      return std::nullopt;
+    const OriginList *List =
+        FactMgr.getOriginMgr().getOrCreateList(ReturnEsc->getReturnExpr());
+    for (const LifetimeVar &LV : ReturnLifetimes) {
+      if (!List)
+        break;
+      if (List->getOuterOriginID() == ReturnEsc->getEscapedOriginID())
+        return LV;
+      List = List->peelOuterOrigin();
+    }
+    return std::nullopt;
   }
 
   /// Whether \p D is a position whose storage the caller has been told will
@@ -319,9 +334,9 @@ public:
   void reportNamedLifetimeViolations() {
     if (!SemaHelper)
       return;
-    for (const auto &[ReturnExpr, Found] : LifetimeViolations)
-      SemaHelper->reportNamedLifetimeViolation(ReturnExpr, Found,
-                                               RequiredReturnLifetime);
+    for (const auto &[ReturnExpr, Violation] : LifetimeViolations)
+      SemaHelper->reportNamedLifetimeViolation(ReturnExpr, Violation.first,
+                                               Violation.second);
     for (const Expr *ReturnExpr : StaticReturnViolations)
       SemaHelper->reportStaticReturnViolation(ReturnExpr);
     for (const auto &[ArgExpr, PVD] : StaticArgumentViolations)
