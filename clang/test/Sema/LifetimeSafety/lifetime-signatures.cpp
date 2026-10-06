@@ -80,6 +80,77 @@ struct S {
   int& $a method(int& $a x) { return x; }
 };
 
+// Members of a class with `LIFETIME_PARAMS`: the class's parameters are part
+// of every member's signature, whether or not the member is annotated. They
+// lead `declared`, and on an instance member they sit beneath the implicit
+// object pointer in `function-type`.
+struct LIFETIME_PARAMS("p", "q") Holder {
+  int* $(p) x;
+  int* $(q) y;
+
+  // An unannotated return takes the lifetime of `this`, which is given the
+  // reserved name `this` when nothing is written on it.
+  // CHECK-LABEL: Lifetime signature for Holder::plain:
+  // CHECK-NEXT:   declared: $p, $q
+  // CHECK-NEXT:   function-type: $this, $p, $q
+  // CHECK-NEXT:   return: $this
+  int* plain() { return x; }
+
+  // A written lifetime on `this` is what an elided return takes.
+  // CHECK-LABEL: Lifetime signature for Holder::elided_from_written:
+  // CHECK-NEXT:   declared: $p, $q, $b
+  // CHECK-NEXT:   function-type: $b, $p, $q
+  // CHECK-NEXT:   return: $b
+  LIFETIME_PARAMS("b")
+  int* elided_from_written() $b { return x; }
+
+  // Every elided level is filled, not just the outermost.
+  // CHECK-LABEL: Lifetime signature for Holder::deep:
+  // CHECK-NEXT:   declared: $p, $q
+  // CHECK-NEXT:   function-type: $this, $p, $q
+  // CHECK-NEXT:   return: $this, $p
+  int* $(p) * deep() { return &x; }
+
+  // `lifetimebound` already describes the result, so elision leaves it alone.
+  // CHECK-LABEL: Lifetime signature for Holder::bound:
+  // CHECK-NEXT:   declared: $p, $q
+  // CHECK-NEXT:   function-type: <elided>, $p, $q
+  // CHECK-NEXT:   return: <none>
+  int* bound(int* a [[clang::lifetimebound]]) { return a; }
+
+  // CHECK-LABEL: Lifetime signature for Holder::on_this:
+  // CHECK-NEXT:   declared: $p, $q, $b
+  // CHECK-NEXT:   function-type: $b, $p, $q
+  // CHECK-NEXT:   return: $p
+  LIFETIME_PARAMS("b")
+  int* $(p) on_this() $b { return x; }
+
+  // A static member has no implicit object, but the names are still in scope.
+  // CHECK-LABEL: Lifetime signature for Holder::make:
+  // CHECK-NEXT:   declared: $p, $q
+  // CHECK-NEXT:   function-type: <none>
+  // CHECK-NEXT:   return: <none>
+  static int make() { return 0; }
+
+  // An unannotated constructor binds nothing, so its result is left to
+  // `lifetimebound`.
+  // CHECK-LABEL: Lifetime signature for Holder::Holder:
+  // CHECK-NEXT:   declared: $p, $q
+  // CHECK-NEXT:   function-type: <elided>, $p, $q
+  // CHECK-NEXT:   return: <none>
+  // CHECK-NEXT:   param 0 ('a'): <none>
+  Holder(int* a) : x(a), y(a) {}
+
+  // An annotated constructor yields an object whose slots are the class's.
+  // CHECK-LABEL: Lifetime signature for Holder::Holder:
+  // CHECK-NEXT:   declared: $p, $q
+  // CHECK-NEXT:   function-type: <elided>, $p, $q
+  // CHECK-NEXT:   return: $p, $q
+  // CHECK-NEXT:   param 0 ('a'): $p
+  // CHECK-NEXT:   param 1 ('b'): $q
+  Holder(int* $(p) a, int* $(q) b) : x(a), y(b) {}
+};
+
 // Unannotated functions produce no output at all.
 // CHECK-NOT: Lifetime signature for unannotated
 int& unannotated(int& x) { return x; }

@@ -75,6 +75,15 @@ private:
   /// to the parameter that imposed the obligation (null for the implicit
   /// object argument).
   llvm::MapVector<const Expr *, const ParmVarDecl *> StaticArgumentViolations;
+  /// Fields of the enclosing class that may hold, when the member function
+  /// returns, a value borrowed from a lifetime other than the one the field's
+  /// type declares. Mapped to (Found, Required).
+  llvm::MapVector<const FieldDecl *,
+                  std::pair<llvm::StringRef, llvm::StringRef>>
+      FieldLifetimeViolations;
+  /// Fields declared `$static` that may hold, when the member function
+  /// returns, a value borrowed from caller storage.
+  llvm::SetVector<const FieldDecl *> StaticFieldViolations;
   /// The lifetimes declared on the return type, ordered outermost-first so
   /// they zip positionally with the returned expression's `OriginList`.
   LifetimeList ReturnLifetimes;
@@ -87,6 +96,20 @@ private:
   /// the outermost level is recorded, because a parameter is given exactly one
   /// placeholder loan however deep its type is.
   llvm::DenseMap<const Decl *, LifetimeVar::Kind> ParamLifetimeKinds;
+  /// The named lifetime of the implicit object parameter, written or supplied
+  /// by elision, or empty if it has none.
+  llvm::StringRef ThisLifetime;
+  /// The lifetimes the enclosing class declares, if this is one of its
+  /// members.
+  llvm::SmallVector<llvm::StringRef, 2> ClassLifetimes;
+  /// Whether the outermost return lifetime was supplied by elision rather than
+  /// written.
+  bool ReturnElidedToThis = false;
+  /// For a return whose lifetime elision supplied: the single class lifetime
+  /// every returned value borrows from, if there is one so far.
+  std::optional<llvm::StringRef> ElidedReturnBorrowsFrom;
+  /// Whether some returned value rules out suggesting a return lifetime.
+  bool ElidedReturnSuggestionBlocked = false;
   const LoanPropagationAnalysis &LoanPropagation;
   const MovedLoansAnalysis &MovedLoans;
   const LiveOriginsAnalysis &LiveOrigins;
@@ -129,8 +152,15 @@ public:
           ParamLifetimeKinds[Fn->getParamDecl(I)] =
               Sig.Params[I].front().getKind();
       if (const auto *MD = dyn_cast<CXXMethodDecl>(Fn);
-          MD && MD->isInstance() && !Sig.FunctionType.empty())
+          MD && MD->isInstance() && !Sig.FunctionType.empty()) {
         ParamLifetimeKinds[MD] = Sig.FunctionType.front().getKind();
+        if (Sig.FunctionType.front().getKind() == LifetimeVar::Kind::Named)
+          ThisLifetime = Sig.FunctionType.front().getName();
+      }
+      for (const LifetimeVar &LV : getEnclosingClassLifetimeParams(AST, Fn))
+        if (LV.getKind() == LifetimeVar::Kind::Named)
+          ClassLifetimes.push_back(LV.getName());
+      ReturnElidedToThis = Sig.ReturnElidedToThis;
     }
     for (const CFGBlock *B : *ADC.getAnalysis<PostOrderCFGView>())
       for (const Fact *F : FactMgr.getFacts(B))
@@ -154,6 +184,8 @@ public:
       reportInapplicableLifetimebound();
     if (LSOpts.CheckNamedLifetimeViolations)
       reportNamedLifetimeViolations();
+    if (LSOpts.SuggestNamedReturnLifetime)
+      suggestElidedReturnLifetime();
     //  Annotation inference is currently guarded by a frontend flag. In the
     //  future, this might be replaced by a design that differentiates between
     //  explicit and inferred findings with separate warning groups.
@@ -212,35 +244,56 @@ public:
           AnnotationWarningsMap.try_emplace(MD, ReturnEsc->getReturnExpr());
       }
     };
+    // A value leaves the function either through the return or by being left
+    // in a field of `*this`. In both cases the type of the place it ends up in
+    // may declare a lifetime, and the value must satisfy it.
     const auto *ReturnEsc = dyn_cast<ReturnEscapeFact>(OEF);
-    std::optional<LifetimeVar> ReturnLifetime =
-        getReturnLifetimeForOrigin(ReturnEsc);
+    const auto *FieldEsc = dyn_cast<FieldEscapeFact>(OEF);
+    std::optional<LifetimeVar> TargetLifetime =
+        ReturnEsc ? getReturnLifetimeForOrigin(ReturnEsc)
+                  : getFieldLifetimeForOrigin(FieldEsc);
     auto CheckNamedLifetime = [&](const NamedLifetime *NL) {
-      // The contract only constrains what is returned.
-      if (!ReturnLifetime ||
-          ReturnLifetime->getKind() != LifetimeVar::Kind::Named)
+      if (!TargetLifetime ||
+          TargetLifetime->getKind() != LifetimeVar::Kind::Named)
         return;
-      if (NL->getName() == ReturnLifetime->getName())
+      if (NL->getName() == TargetLifetime->getName())
         return;
-      // With no outlives relation between lifetimes, the acceptance set for
-      // `$a` is exactly `{$a}`.
-      LifetimeViolations.try_emplace(
-          ReturnEsc->getReturnExpr(),
-          std::make_pair(NL->getName(), ReturnLifetime->getName()));
+      // The one outlives relation that holds without being written: an object
+      // cannot outlive its own lifetime parameters, so each of the class's
+      // lifetimes outlives that of `this`. Without it, an unannotated accessor
+      // returning a field would be rejected by the very elision that gave it a
+      // return lifetime.
+      if (ReturnEsc && !ThisLifetime.empty() &&
+          TargetLifetime->getName() == ThisLifetime &&
+          llvm::is_contained(ClassLifetimes, NL->getName()))
+        return;
+      // Otherwise there is no outlives relation between lifetimes, and the
+      // acceptance set for `$a` is exactly `{$a}`.
+      auto Violation = std::make_pair(NL->getName(), TargetLifetime->getName());
+      if (ReturnEsc)
+        LifetimeViolations.try_emplace(ReturnEsc->getReturnExpr(), Violation);
+      else
+        FieldLifetimeViolations.try_emplace(FieldEsc->getFieldDecl(),
+                                            Violation);
     };
-    // A `$static` return promises storage that never expires, which nothing
+    // A `$static` position promises storage that never expires, which nothing
     // the caller passes in provides -- unless the caller was itself told to
     // pass storage that never expires. \p Source is the position the loan came
     // from, or null for a loan minted from a named lifetime, which is
     // caller-scoped by construction.
-    auto CheckStaticReturn = [&](const Decl *Source) {
-      if (!ReturnLifetime ||
-          ReturnLifetime->getKind() != LifetimeVar::Kind::Static)
+    auto CheckStatic = [&](const Decl *Source) {
+      if (!TargetLifetime ||
+          TargetLifetime->getKind() != LifetimeVar::Kind::Static)
         return;
       if (Source && declaresStaticSafeLifetime(Source))
         return;
-      StaticReturnViolations.insert(ReturnEsc->getReturnExpr());
+      if (ReturnEsc)
+        StaticReturnViolations.insert(ReturnEsc->getReturnExpr());
+      else
+        StaticFieldViolations.insert(FieldEsc->getFieldDecl());
     };
+    if (ReturnEsc && ReturnElidedToThis)
+      noteElidedReturn(ReturnEsc, EscapedLoans);
     auto MovedAtEscape = MovedLoans.getMovedLoans(OEF);
     for (LoanID LID : EscapedLoans) {
       const Loan *L = FactMgr.getLoanMgr().getLoan(LID);
@@ -249,13 +302,13 @@ public:
         continue;
       if (const auto *PVD = PB->getParmVarDecl()) {
         CheckParam(PVD, /*IsMoved=*/MovedAtEscape.lookup(LID));
-        CheckStaticReturn(PVD);
+        CheckStatic(PVD);
       } else if (const auto *MD = PB->getImplicitThisParent()) {
         CheckImplicitThis(MD);
-        CheckStaticReturn(MD);
+        CheckStatic(MD);
       } else if (const auto *NL = PB->getNamedLifetime()) {
         CheckNamedLifetime(NL);
-        CheckStaticReturn(/*Source=*/nullptr);
+        CheckStatic(/*Source=*/nullptr);
       }
     }
   }
@@ -277,6 +330,82 @@ public:
       List = List->peelOuterOrigin();
     }
     return std::nullopt;
+  }
+
+  /// Records what a value returned through an elided return lifetime borrows
+  /// from, to decide whether the return should have been annotated.
+  ///
+  /// The suggestion is made only when every returned value borrows from one and
+  /// the same class lifetime and from nothing else. That is the shape of a view
+  /// type's accessor, for which elision is needlessly strict: the result is
+  /// tied to the object although it would live as long as the class lifetime.
+  /// Anything else -- a borrow from `*this` itself, from a parameter, or from
+  /// two class lifetimes -- means the elided lifetime may well be the right
+  /// one, so nothing is suggested.
+  void noteElidedReturn(const ReturnEscapeFact *ReturnEsc,
+                        const LoanSet &EscapedLoans) {
+    const OriginList *List =
+        FactMgr.getOriginMgr().getOrCreateList(ReturnEsc->getReturnExpr());
+    if (!List || List->getOuterOriginID() != ReturnEsc->getEscapedOriginID())
+      return;
+    for (LoanID LID : EscapedLoans) {
+      const Loan *L = FactMgr.getLoanMgr().getLoan(LID);
+      const PlaceholderBase *PB = L->getAccessPath().getAsPlaceholderBase();
+      const NamedLifetime *NL = PB ? PB->getNamedLifetime() : nullptr;
+      if (!NL || !llvm::is_contained(ClassLifetimes, NL->getName()) ||
+          (ElidedReturnBorrowsFrom &&
+           *ElidedReturnBorrowsFrom != NL->getName())) {
+        ElidedReturnSuggestionBlocked = true;
+        return;
+      }
+      ElidedReturnBorrowsFrom = NL->getName();
+    }
+  }
+
+  void suggestElidedReturnLifetime() {
+    if (!SemaHelper || ElidedReturnSuggestionBlocked ||
+        !ElidedReturnBorrowsFrom)
+      return;
+    SemaHelper->suggestReturnLifetimeFromClass(cast<FunctionDecl>(FD),
+                                               *ElidedReturnBorrowsFrom);
+  }
+
+  /// Finds the lifetime written on the field escaping in \p FieldEsc at the
+  /// level of the escaping origin.
+  ///
+  /// Only fields of the class whose member is being analyzed carry a contract
+  /// here: the field's declared lifetimes are those of `*this`, which is the
+  /// object the member function leaves them in. A destructor emits no field
+  /// escapes, so it is never held to them.
+  std::optional<LifetimeVar>
+  getFieldLifetimeForOrigin(const FieldEscapeFact *FieldEsc) const {
+    if (!FieldEsc)
+      return std::nullopt;
+    const FieldDecl *Field = FieldEsc->getFieldDecl();
+    const auto *MD = dyn_cast_if_present<CXXMethodDecl>(FD);
+    if (!MD || Field->getParent() != MD->getParent())
+      return std::nullopt;
+    const OriginList *List = FactMgr.getOriginMgr().getOrCreateList(Field);
+    for (const LifetimeVar &LV : getExplicitLifetimes(AST, Field->getType())) {
+      if (!List)
+        break;
+      if (List->getOuterOriginID() == FieldEsc->getEscapedOriginID())
+        return LV;
+      List = List->peelOuterOrigin();
+    }
+    return std::nullopt;
+  }
+
+  /// The best place to blame for what \p Field holds when the member function
+  /// returns: the field's initializer, if this is a constructor that writes
+  /// one, and otherwise the function itself, since the analysis does not
+  /// record which store left the value there.
+  SourceLocation getFieldBlameLoc(const FieldDecl *Field) const {
+    if (const auto *Ctor = dyn_cast_if_present<CXXConstructorDecl>(FD))
+      for (const CXXCtorInitializer *Init : Ctor->inits())
+        if (Init->isWritten() && Init->getMember() == Field)
+          return Init->getInit()->getExprLoc();
+    return FD->getLocation();
   }
 
   /// Whether \p D is a position whose storage the caller has been told will
@@ -341,6 +470,11 @@ public:
       SemaHelper->reportStaticReturnViolation(ReturnExpr);
     for (const auto &[ArgExpr, PVD] : StaticArgumentViolations)
       SemaHelper->reportStaticArgumentViolation(ArgExpr, PVD);
+    for (const auto &[Field, Violation] : FieldLifetimeViolations)
+      SemaHelper->reportFieldLifetimeViolation(
+          getFieldBlameLoc(Field), Field, Violation.first, Violation.second);
+    for (const FieldDecl *Field : StaticFieldViolations)
+      SemaHelper->reportStaticFieldViolation(getFieldBlameLoc(Field), Field);
   }
 
   /// Checks for use-after-free & use-after-return errors when an access path

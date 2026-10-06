@@ -401,6 +401,10 @@ struct ExpectedLoan {
   };
   Kind K;
   std::string Name;
+  /// For `Var`, selects a single loan to the variable -- the Nth one issued,
+  /// counting from zero -- instead of every loan to it. Loans are issued as the
+  /// CFG is visited, which is source order within straight-line code.
+  std::optional<unsigned> Nth = std::nullopt;
 };
 
 // A helper class to represent a set of origins, identified by variable names.
@@ -520,6 +524,16 @@ MATCHER_P2(HoldsExactlyImpl, Expected, Annotation, "") {
       if (LIDs.empty()) {
         *result_listener << "no loan to variable '" << E.Name << "'";
         return false;
+      }
+      if (E.Nth) {
+        if (*E.Nth >= LIDs.size()) {
+          *result_listener << "variable '" << E.Name << "' has only "
+                           << LIDs.size() << " loan(s), but loan #" << *E.Nth
+                           << " was expected";
+          return false;
+        }
+        ExpectedLoans.push_back(LIDs[*E.Nth]);
+        break;
       }
       ExpectedLoans.insert(ExpectedLoans.end(), LIDs.begin(), LIDs.end());
       break;
@@ -748,6 +762,11 @@ protected:
   /// Names for the four kinds of loan `HoldsExactly` can assert on.
   static ExpectedLoan VarLoan(llvm::StringRef Var) {
     return {ExpectedLoan::Kind::Var, Var.str()};
+  }
+  /// Only the \p Nth loan issued to \p Var, for code that borrows the same
+  /// variable more than once.
+  static ExpectedLoan VarLoan(llvm::StringRef Var, unsigned Nth) {
+    return {ExpectedLoan::Kind::Var, Var.str(), Nth};
   }
   static ExpectedLoan ParamLoan(llvm::StringRef Param) {
     return {ExpectedLoan::Kind::Param, Param.str()};
@@ -2817,19 +2836,19 @@ TEST_F(LifetimeAnalysisTest, RecordMemberAccessFlowsPerSlot) {
     Pair $2(a, b) make_pair(int* $a x, int* $b y);
 
     void target() {
-      int x, y, x2, y2;
+      int x, y;
       Pair p = make_pair(&x, &y);
       int* r1 = p.first;
       int* r2 = p.second;
       int* pr1 = (&p)->first;
-      int* pr2 = make_pair(&x2, &y2).second;
+      int* pr2 = make_pair(&x, &y).second;
       POINT(after);
     }
   )");
-  EXPECT_THAT(Origin("r1"), HoldsExactly({VarLoan("x")}, "after"));
-  EXPECT_THAT(Origin("r2"), HoldsExactly({VarLoan("y")}, "after"));
-  EXPECT_THAT(Origin("pr1"), HoldsExactly({VarLoan("x")}, "after"));
-  EXPECT_THAT(Origin("pr2"), HoldsExactly({VarLoan("y2")}, "after"));
+  EXPECT_THAT(Origin("r1"), HoldsExactly({VarLoan("x", 0)}, "after"));
+  EXPECT_THAT(Origin("r2"), HoldsExactly({VarLoan("y", 0)}, "after"));
+  EXPECT_THAT(Origin("pr1"), HoldsExactly({VarLoan("x", 0)}, "after"));
+  EXPECT_THAT(Origin("pr2"), HoldsExactly({VarLoan("y", 1)}, "after"));
 }
 
 TEST_F(LifetimeAnalysisTest, RecordConstructorAndAggregateInitFlowPerSlot) {
@@ -2845,9 +2864,9 @@ TEST_F(LifetimeAnalysisTest, RecordConstructorAndAggregateInitFlowPerSlot) {
     };
 
     void target() {
-      int x1, y1, x2, y2;
-      CtorPair cp(&x1, &y1);
-      AggPair ap{&x2, &y2};
+      int x, y;
+      CtorPair cp(&x, &y);
+      AggPair ap{&x, &y};
       int* cr1 = cp.first;
       int* cr2 = cp.second;
       int* ar1 = ap.first;
@@ -2855,14 +2874,14 @@ TEST_F(LifetimeAnalysisTest, RecordConstructorAndAggregateInitFlowPerSlot) {
       POINT(after);
     }
   )");
-  EXPECT_THAT(Origin("cp", 0), HoldsExactly({VarLoan("x1")}, "after"));
-  EXPECT_THAT(Origin("cp", 1), HoldsExactly({VarLoan("y1")}, "after"));
-  EXPECT_THAT(Origin("ap", 0), HoldsExactly({VarLoan("x2")}, "after"));
-  EXPECT_THAT(Origin("ap", 1), HoldsExactly({VarLoan("y2")}, "after"));
-  EXPECT_THAT(Origin("cr1"), HoldsExactly({VarLoan("x1")}, "after"));
-  EXPECT_THAT(Origin("cr2"), HoldsExactly({VarLoan("y1")}, "after"));
-  EXPECT_THAT(Origin("ar1"), HoldsExactly({VarLoan("x2")}, "after"));
-  EXPECT_THAT(Origin("ar2"), HoldsExactly({VarLoan("y2")}, "after"));
+  EXPECT_THAT(Origin("cp", 0), HoldsExactly({VarLoan("x", 0)}, "after"));
+  EXPECT_THAT(Origin("cp", 1), HoldsExactly({VarLoan("y", 0)}, "after"));
+  EXPECT_THAT(Origin("ap", 0), HoldsExactly({VarLoan("x", 1)}, "after"));
+  EXPECT_THAT(Origin("ap", 1), HoldsExactly({VarLoan("y", 1)}, "after"));
+  EXPECT_THAT(Origin("cr1"), HoldsExactly({VarLoan("x", 0)}, "after"));
+  EXPECT_THAT(Origin("cr2"), HoldsExactly({VarLoan("y", 0)}, "after"));
+  EXPECT_THAT(Origin("ar1"), HoldsExactly({VarLoan("x", 1)}, "after"));
+  EXPECT_THAT(Origin("ar2"), HoldsExactly({VarLoan("y", 1)}, "after"));
 }
 
 } // anonymous namespace

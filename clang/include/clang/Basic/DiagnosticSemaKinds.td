@@ -11083,7 +11083,7 @@ def warn_lifetime_safety_lifetime_arity_mismatch
       DefaultIgnore;
 
 def warn_lifetime_safety_undeclared_lifetime
-    : Warning<"lifetime '%0' is not declared by this function; "
+    : Warning<"lifetime '%0' is not declared by this %select{function|class}1; "
               "add it to a LIFETIME_PARAMS annotation">,
       InGroup<LifetimeSafetyUndeclaredLifetime>,
       DefaultIgnore;
@@ -11119,6 +11119,18 @@ def warn_lifetime_safety_conflicting_lifetime_signature
       InGroup<LifetimeSafetyNamedLifetimes>,
       DefaultIgnore;
 
+def warn_lifetime_safety_lifetime_params_base
+    : Warning<"base class %0 declares lifetime parameters, which are not yet "
+              "tracked through derived class %1">,
+      InGroup<LifetimeSafetyNamedLifetimes>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_lifetime_in_template_argument
+    : Warning<"lifetime annotation inside a template argument is not yet "
+              "tracked and is ignored">,
+      InGroup<LifetimeSafetyNamedLifetimes>,
+      DefaultIgnore;
+
 def warn_lifetime_safety_named_lifetime_violation
     : Warning<"returning a value borrowed from lifetime '%0', but the return "
               "type declares lifetime '%1'">,
@@ -11137,6 +11149,20 @@ def warn_lifetime_safety_static_argument_violation
               "lifetime 'static'">,
       InGroup<LifetimeSafetyNamedLifetimeViolation>,
       DefaultIgnore;
+
+def warn_lifetime_safety_field_lifetime_violation
+    : Warning<"field %0 may be left holding a value borrowed from lifetime "
+              "'%1', but its type declares lifetime '%2'">,
+      InGroup<LifetimeSafetyNamedLifetimeViolation>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_static_field_violation
+    : Warning<"field %0 may be left holding a value borrowed from this "
+              "function's caller, but its type declares lifetime 'static'">,
+      InGroup<LifetimeSafetyNamedLifetimeViolation>,
+      DefaultIgnore;
+
+def note_lifetime_safety_field_declared_here : Note<"field %0 declared here">;
 
 def warn_lifetime_safety_reserved_lifetime_param
     : Warning<"'%0' is a distinguished lifetime and cannot be introduced as a "
@@ -11158,6 +11184,13 @@ def warn_lifetime_safety_lifetimebound_lifetime_conflict
               "declares lifetime '%1' while the return type declares "
               "lifetime '%2'">,
       InGroup<LifetimeSafetyLifetimeboundConflict>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_elided_return_could_be_named
+    : Warning<"return type of %0 defaults to the lifetime of the object, but "
+              "everything it returns is borrowed from lifetime '%1'; annotate "
+              "the return type with lifetime '%1' to let callers rely on it">,
+      InGroup<LifetimeSafetyNamedLifetimeSuggestions>,
       DefaultIgnore;
 
 def warn_lifetime_safety_missing_lifetimebound

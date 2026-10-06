@@ -8,6 +8,8 @@
 
 #include "clang/Analysis/Analyses/LifetimeSafety/SignatureCheck.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
+#include "clang/AST/DynamicRecursiveASTVisitor.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LifetimeAnnotations.h"
 #include "clang/Basic/SourceManager.h"
@@ -19,7 +21,48 @@
 namespace clang::lifetimes::internal {
 namespace {
 
-/// Validates the annotations written on one declaration of a function.
+/// Finds lifetime annotations written inside template arguments, e.g. the `$a`
+/// in `View<int *$a>`.
+///
+/// Such an annotation is sugar on the spelling of the argument only. A class
+/// template specialization is keyed on canonical arguments, so `View<int *$a>`
+/// and `View<int *>` are the same specialization, and its fields are
+/// instantiated without the annotation. Nothing the analysis reads through
+/// carries the lifetime, so it is silently dropped. Crubit instead appends a
+/// specialization's template-argument lifetimes to the record's own; until
+/// that is modelled, the annotation is reported as ignored.
+class TemplateArgLifetimeFinder : public DynamicRecursiveASTVisitor {
+public:
+  explicit TemplateArgLifetimeFinder(const SourceManager &SM) : SM(SM) {}
+
+  bool TraverseTemplateArgumentLoc(const TemplateArgumentLoc &ArgLoc) override {
+    ++Depth;
+    bool Result =
+        DynamicRecursiveASTVisitor::TraverseTemplateArgumentLoc(ArgLoc);
+    --Depth;
+    return Result;
+  }
+
+  bool VisitAttributedTypeLoc(AttributedTypeLoc TL) override {
+    if (Depth == 0)
+      return true;
+    const auto *ATA = dyn_cast_or_null<AnnotateTypeAttr>(TL.getAttr());
+    if (ATA && ATA->getAnnotation() == LifetimeAnnotationCategory)
+      // The attribute's own location is inside the `$a` macro's definition;
+      // its expansion location is where the user wrote it.
+      Locs.push_back(SM.getExpansionLoc(ATA->getLocation()));
+    return true;
+  }
+
+  llvm::SmallVector<SourceLocation, 2> Locs;
+
+private:
+  const SourceManager &SM;
+  unsigned Depth = 0;
+};
+
+/// Validates the annotations written on one declaration of a function, or on
+/// a class and its fields.
 class SignatureChecker {
 public:
   SignatureChecker(const ASTContext &Ctx, LifetimeSafetySemaHelper &Helper)
@@ -28,13 +71,28 @@ public:
   /// Collects the lifetimes introduced by \p FD, reporting any that are
   /// introduced more than once.
   void collectDeclared(const FunctionDecl *FD) {
+    // The enclosing class's parameters are in scope for every member. Their
+    // own well-formedness is checked with the class; here they only need to be
+    // known, so that a member reintroducing one can be told it already exists.
     if (const auto *MD = dyn_cast<CXXMethodDecl>(FD))
-      if (const CXXRecordDecl *RD = MD->getParent()->getDefinition())
-        for (const LifetimeVar &LV : getDeclaredLifetimeParams(Ctx, RD))
-          if (LV.getKind() == LifetimeVar::Kind::Named)
-            InScope.insert(LV.getName());
+      for (const LifetimeUse &Use :
+           getDeclaredLifetimes(Ctx, MD->getParent()->getDefinition()).Params)
+        if (Use.Var.getKind() == LifetimeVar::Kind::Named) {
+          ClassDeclared.try_emplace(Use.Var.getName(), Use.Loc);
+          InScope.insert(Use.Var.getName());
+        }
+    collectDeclaredOn(FD);
+  }
 
-    DeclaredLifetimes Declared = getDeclaredLifetimes(Ctx, FD);
+  /// Collects the lifetimes introduced by \p RD for checking its fields.
+  void collectDeclared(const CXXRecordDecl *RD) {
+    InClass = true;
+    collectDeclaredOn(RD);
+  }
+
+private:
+  void collectDeclaredOn(const Decl *D) {
+    DeclaredLifetimes Declared = getDeclaredLifetimes(Ctx, D);
 
     if (Declared.NonLiteralArgLoc.isValid())
       Helper.reportNonLiteralLifetimeArgument(Declared.NonLiteralArgLoc);
@@ -51,8 +109,10 @@ public:
       // `$static` and `$unknown` already denote something fixed, so declaring
       // them introduces nothing. Crubit takes the same view from the other
       // direction: `BindingContext::new` pre-seeds both as builtin bindings,
-      // so a user declaration of either is redundant at best.
-      if (Use.Var.getKind() != LifetimeVar::Kind::Named) {
+      // so a user declaration of either is redundant at best. `this` is
+      // reserved for the lifetime elision gives the implicit object parameter.
+      if (Use.Var.getKind() != LifetimeVar::Kind::Named ||
+          Use.Var.getName() == ImplicitThisLifetimeName) {
         Helper.reportReservedLifetimeParam(Use.Loc, Use.Var.getName());
         continue;
       }
@@ -60,11 +120,19 @@ public:
       if (!Inserted)
         Helper.reportDuplicateLifetimeParam(Use.Loc, It->second,
                                             Use.Var.getName());
+      // A member cannot introduce a lifetime its class already has: both
+      // would be spelled the same, and every use would silently bind to the
+      // class's.
+      else if (auto Class = ClassDeclared.find(Use.Var.getName());
+               Class != ClassDeclared.end())
+        Helper.reportDuplicateLifetimeParam(Use.Loc, Class->second,
+                                            Use.Var.getName());
       // A lifetime introduced on any declaration is in scope for all of them.
       InScope.insert(Use.Var.getName());
     }
   }
 
+public:
   /// Checks the types written on \p FD against the lifetimes in scope.
   void checkTypes(const FunctionDecl *FD) {
     const TypeSourceInfo *TSI = FD->getTypeSourceInfo();
@@ -100,10 +168,43 @@ public:
         checkType(ParmTSI->getTypeLoc());
   }
 
+  /// Checks the types of \p RD's fields against the lifetimes \p RD declares.
+  ///
+  /// A field can only name its class's own lifetimes: there is nothing else in
+  /// scope for it, since a field's lifetimes are substituted from those of the
+  /// object it is read through.
+  void checkFields(const CXXRecordDecl *RD) {
+    for (const FieldDecl *Field : RD->fields())
+      if (const TypeSourceInfo *TSI = Field->getTypeSourceInfo())
+        checkType(TSI->getTypeLoc());
+  }
+
+  /// Diagnoses direct bases of \p RD that declare lifetime parameters.
+  ///
+  /// Crubit appends a base's parameters to the derived class's own. The
+  /// analysis does not model that yet: a derived object's origins cover only
+  /// the parameters the derived class itself declares, so fields inherited
+  /// from such a base would silently go untracked. Indirect bases are reached
+  /// through the intermediate class, which is diagnosed in its own right.
+  void checkBases(const CXXRecordDecl *RD) {
+    for (const CXXBaseSpecifier &Base : RD->bases()) {
+      const CXXRecordDecl *BaseRD = Base.getType()->getAsCXXRecordDecl();
+      if (!BaseRD || !(BaseRD = BaseRD->getDefinition()))
+        continue;
+      if (!getDeclaredLifetimeParams(Ctx, BaseRD).empty())
+        Helper.reportLifetimeParamsBase(Base.getBaseTypeLoc(), Base.getType(),
+                                        RD);
+    }
+  }
+
 private:
   void checkType(TypeLoc TL) {
     if (!TL)
       return;
+    TemplateArgLifetimeFinder Finder(Ctx.getSourceManager());
+    Finder.TraverseTypeLoc(TL);
+    for (SourceLocation Loc : Finder.Locs)
+      Helper.reportLifetimeInTemplateArgument(Loc);
     WrittenLifetimes Written = getWrittenLifetimes(Ctx, TL);
     if (Written.NonLiteralArgLoc.isValid())
       Helper.reportNonLiteralLifetimeArgument(Written.NonLiteralArgLoc);
@@ -123,10 +224,17 @@ private:
     if (Uses.empty())
       return;
 
-    // Writing fewer lifetimes than a level can carry is fine: the remaining
-    // slots are simply unconstrained. Writing more cannot be given a meaning.
+    // Writing more lifetimes than a level can carry cannot be given a meaning.
+    // Writing fewer is only possible on a class type, since a pointer level has
+    // exactly one slot and a level with nothing written is not checked here.
+    // A class type's lifetimes bind positionally, so `Pair $a` would silently
+    // mean "the first one is `$a`", and nothing at the use says whether the
+    // rest were left open deliberately. Crubit rejects it for the same reason.
+    // A class type therefore takes all of its lifetimes or none, and `$unknown`
+    // spells "don't care" for a slot the author does not want to name. Aliases
+    // resolve to the class they name, so they are held to the same count.
     unsigned Slots = getLifetimeSlotsAtLevel(Ctx, LevelType);
-    if (Uses.size() > Slots)
+    if (Uses.size() != Slots)
       Helper.reportLifetimeArityMismatch(Uses.front().Loc, LevelType,
                                          Uses.size(), Slots);
 
@@ -135,13 +243,18 @@ private:
       if (Use.Var.getKind() != LifetimeVar::Kind::Named)
         continue;
       if (!InScope.contains(Use.Var.getName()))
-        Helper.reportUndeclaredLifetime(Use.Loc, Use.Var.getName());
+        Helper.reportUndeclaredLifetime(Use.Loc, Use.Var.getName(), InClass);
     }
   }
 
   const ASTContext &Ctx;
   LifetimeSafetySemaHelper &Helper;
   llvm::StringSet<> InScope;
+  /// The lifetimes the enclosing class declares, when checking a member, with
+  /// the location of each declaration.
+  llvm::StringMap<SourceLocation> ClassDeclared;
+  /// Whether the declaration being checked is a class rather than a function.
+  bool InClass = false;
 };
 
 /// Reports declarations whose written lifetimes disagree.
@@ -191,9 +304,12 @@ void checkLifetimeboundAgreement(const ASTContext &Ctx, const FunctionDecl *FD,
                                  const LifetimeSafetyOpts &Opts) {
   LifetimeSignature Sig = getLifetimeSignature(Ctx, FD);
   // A return type that names no lifetime states no contract to compare
-  // against.
+  // against. Nor does one whose lifetime elision supplied: that only happens
+  // when no `lifetimebound` is written, and suggesting one on the implicit
+  // object parameter of every unannotated accessor would be noise.
   if (Sig.Return.empty() ||
-      Sig.Return.front().getKind() == LifetimeVar::Kind::Elided)
+      Sig.Return.front().getKind() == LifetimeVar::Kind::Elided ||
+      Sig.ReturnElidedToThis)
     return;
   LifetimeVar::Kind ReturnKind = Sig.Return.front().getKind();
   llvm::StringRef ReturnLifetime = Sig.Return.front().getName();
@@ -341,6 +457,20 @@ void checkNamedLifetimes(AnalysisDeclContext &AC,
 
   if (Opts.CheckLifetimeboundConflict || Opts.SuggestNamedLifetimebound)
     checkLifetimeboundAgreement(Ctx, FD, *SemaHelper, Opts);
+}
+
+void checkRecordNamedLifetimes(const ASTContext &Ctx, const CXXRecordDecl *RD,
+                               LifetimeSafetySemaHelper &SemaHelper) {
+  if (!RD || !RD->isThisDeclarationADefinition())
+    return;
+  // As with functions, an instantiation repeats the pattern's annotations
+  // verbatim, so only the pattern is checked.
+  if (isTemplateInstantiation(RD->getTemplateSpecializationKind()))
+    return;
+  SignatureChecker Checker(Ctx, SemaHelper);
+  Checker.collectDeclared(RD);
+  Checker.checkFields(RD);
+  Checker.checkBases(RD);
 }
 
 } // namespace clang::lifetimes::internal

@@ -17,6 +17,7 @@
 
 #include "clang/Analysis/Analyses/LifetimeSafety/LifetimeAnnotations.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LifetimeSafety.h"
+#include "clang/Analysis/Analyses/LifetimeSafety/SignatureCheck.h"
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/Preprocessor.h"
@@ -81,7 +82,9 @@ inline bool ShouldCheckNamedLifetimes(Sema &S, const Decl *D) {
       diag::warn_lifetime_safety_duplicate_lifetime_param,
       diag::warn_lifetime_safety_repeated_lifetime_params,
       diag::warn_lifetime_safety_non_literal_lifetime,
-      diag::warn_lifetime_safety_conflicting_lifetime_signature};
+      diag::warn_lifetime_safety_conflicting_lifetime_signature,
+      diag::warn_lifetime_safety_lifetime_params_base,
+      diag::warn_lifetime_safety_lifetime_in_template_argument};
   for (unsigned DiagID : DiagIDs)
     if (!Diags.isIgnored(DiagID, D->getBeginLoc()))
       return true;
@@ -102,6 +105,12 @@ inline bool ShouldCheckLifetimeboundConflict(Sema &S, const Decl *D) {
 inline bool ShouldSuggestNamedLifetimebound(Sema &S, const Decl *D) {
   return !S.getDiagnostics().isIgnored(
       diag::warn_lifetime_safety_missing_lifetimebound, D->getBeginLoc());
+}
+
+inline bool ShouldSuggestNamedReturnLifetime(Sema &S, const Decl *D) {
+  return !S.getDiagnostics().isIgnored(
+      diag::warn_lifetime_safety_elided_return_could_be_named,
+      D->getBeginLoc());
 }
 
 inline bool ShouldSuggestLifetimeAnnotations(Sema &S, const Decl *D) {
@@ -150,6 +159,7 @@ inline bool IsLifetimeSafetyEnabled(Sema &S, const Decl *D) {
          ShouldCheckNamedLifetimeViolations(S, D) ||
          ShouldCheckLifetimeboundConflict(S, D) ||
          ShouldSuggestNamedLifetimebound(S, D) ||
+         ShouldSuggestNamedReturnLifetime(S, D) ||
          ShouldSuggestLifetimeAnnotations(S, D);
 }
 
@@ -168,6 +178,7 @@ inline LifetimeSafetyOpts GetLifetimeSafetyOpts(Sema &S, const Decl *D) {
       ShouldCheckNamedLifetimeViolations(S, D);
   LSOpts.CheckLifetimeboundConflict = ShouldCheckLifetimeboundConflict(S, D);
   LSOpts.SuggestNamedLifetimebound = ShouldSuggestNamedLifetimebound(S, D);
+  LSOpts.SuggestNamedReturnLifetime = ShouldSuggestNamedReturnLifetime(S, D);
   return LSOpts;
 }
 
@@ -487,9 +498,10 @@ public:
         << T << Expected << Found;
   }
 
-  void reportUndeclaredLifetime(SourceLocation Loc,
-                                llvm::StringRef Name) override {
-    S.Diag(Loc, diag::warn_lifetime_safety_undeclared_lifetime) << Name;
+  void reportUndeclaredLifetime(SourceLocation Loc, llvm::StringRef Name,
+                                bool InClass) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_undeclared_lifetime)
+        << Name << InClass;
   }
 
   void reportLifetimeOnFunctionType(SourceLocation Loc) override {
@@ -506,6 +518,16 @@ public:
                                     SourceLocation PrevLoc) override {
     S.Diag(Loc, diag::warn_lifetime_safety_repeated_lifetime_params);
     S.Diag(PrevLoc, diag::note_lifetime_safety_previous_lifetime_params);
+  }
+
+  void reportLifetimeParamsBase(SourceLocation Loc, QualType Base,
+                                const CXXRecordDecl *Derived) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_lifetime_params_base)
+        << Base << Derived;
+  }
+
+  void reportLifetimeInTemplateArgument(SourceLocation Loc) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_lifetime_in_template_argument);
   }
 
   void reportNonLiteralLifetimeArgument(SourceLocation Loc) override {
@@ -556,6 +578,32 @@ public:
         << ArgExpr->getSourceRange();
     if (PVD)
       S.Diag(PVD->getLocation(), diag::note_lifetime_safety_static_param_here);
+  }
+
+  void reportFieldLifetimeViolation(SourceLocation Loc, const FieldDecl *Field,
+                                    llvm::StringRef Found,
+                                    llvm::StringRef Required) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_field_lifetime_violation)
+        << Field << Found << Required;
+    S.Diag(Loc, diag::note_lifetime_safety_outlives_bound_would_help)
+        << Found << Required;
+    S.Diag(Field->getLocation(), diag::note_lifetime_safety_field_declared_here)
+        << Field;
+  }
+
+  void suggestReturnLifetimeFromClass(const FunctionDecl *FD,
+                                      llvm::StringRef Lifetime) override {
+    SourceRange ReturnRange = FD->getReturnTypeSourceRange();
+    S.Diag(ReturnRange.isValid() ? ReturnRange.getBegin() : FD->getLocation(),
+           diag::warn_lifetime_safety_elided_return_could_be_named)
+        << FD << Lifetime << ReturnRange;
+  }
+
+  void reportStaticFieldViolation(SourceLocation Loc,
+                                  const FieldDecl *Field) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_static_field_violation) << Field;
+    S.Diag(Field->getLocation(), diag::note_lifetime_safety_field_declared_here)
+        << Field;
   }
 
   /// Points at the return type's annotation, which is what establishes the

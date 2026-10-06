@@ -360,5 +360,79 @@ void pair_ctor_and_agg_init(int* keep) {
   use(*a2); // expected-note {{later used here}}
 }
 
+//===----------------------------------------------------------------------===//
+// Which steps the alias notes name
+//===----------------------------------------------------------------------===//
+//
+// The notes come from the shared use-after-scope machinery, which names a step
+// only when it is an expression of its own on the path the loan took. A use of
+// a variable shares that variable's origins, so the variable is named when its
+// value is copied out -- as a by-value argument, above, gets
+// "local variable 'p' aliases ..." -- but not when it is accessed in place:
+// `p.second` above, and `p.get_second()`, reach the loan without naming `p`.
+// This is the same rule the analysis applies to unannotated code, where a call
+// to a non-const accessor on a gsl::Pointer variable does not name the
+// variable either, and a call to a const one does, through the qualification
+// conversion of the object argument.
 
+struct LIFETIME_PARAMS("a") Box {
+  int* $a p;
+  int* $a get() { return p; }
+  int* $a get_const() const { return p; }
+};
 
+LIFETIME_PARAMS("a")
+Box $a make_box(int* $a p);
+
+void notes_follow_copies() {
+  int* r1;
+  {
+    int local = 0;
+    Box b = make_box(&local); // expected-warning {{local variable 'local' does not live long enough}}
+                              // expected-note@-1 {{result of call to 'make_box' aliases the storage of local variable 'local'}}
+    r1 = b.get(); // expected-note {{result of call to 'get' aliases the storage of local variable 'local'}}
+  } // expected-note {{local variable 'local' is destroyed here}}
+  use(*r1); // expected-note {{later used here}}
+
+  int* r2;
+  {
+    int local = 0;
+    Box b = make_box(&local); // expected-warning {{local variable 'local' does not live long enough}}
+                              // expected-note@-1 {{result of call to 'make_box' aliases the storage of local variable 'local'}}
+    r2 = b.get_const(); // expected-note {{local variable 'b' aliases the storage of local variable 'local'}}
+                        // expected-note@-1 {{result of call to 'get_const' aliases the storage of local variable 'local'}}
+  } // expected-note {{local variable 'local' is destroyed here}}
+  use(*r2); // expected-note {{later used here}}
+}
+
+//===----------------------------------------------------------------------===//
+// Class templates
+//===----------------------------------------------------------------------===//
+//
+// A specialization of a class template carries the pattern's LIFETIME_PARAMS
+// and field annotations, so it is modelled like any other annotated class.
+
+template <typename T>
+struct LIFETIME_PARAMS("a") TBox {
+  T* $a p;
+  T* $a get() { return p; }
+};
+
+void template_box(int* keep) {
+  int* r1;
+  {
+    int local = 0;
+    TBox<int> b{&local}; // expected-warning {{local variable 'local' does not live long enough}}
+    r1 = b.get(); // expected-note {{result of call to 'get' aliases the storage of local variable 'local'}}
+  } // expected-note {{local variable 'local' is destroyed here}}
+  use(*r1); // expected-note {{later used here}}
+
+  int* r2;
+  {
+    int local = 0;
+    TBox<int> b{keep};
+    r2 = b.get();
+    (void)local;
+  }
+  use(*r2);
+}

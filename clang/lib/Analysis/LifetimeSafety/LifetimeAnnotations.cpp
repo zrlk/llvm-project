@@ -753,6 +753,70 @@ LifetimeSignature getDirectLifetimeSignature(const ASTContext &Ctx,
   return Sig;
 }
 
+/// Counts the lifetime slots across every indirection level of \p QT, i.e. the
+/// length of the list `getExplicitLifetimes` would produce if every slot were
+/// written.
+static unsigned countLifetimeSlots(const ASTContext &Ctx, QualType QT) {
+  unsigned Total = 0;
+  while (!QT.isNull()) {
+    if (const auto *AT = QT->getAs<AtomicType>())
+      QT = AT->getValueType();
+    Total += getLifetimeSlotsAtLevel(Ctx, QT);
+    if (!QT->isPointerOrReferenceType())
+      break;
+    QT = QT->getPointeeType();
+  }
+  return Total;
+}
+
+/// Whether `lifetimebound` is written anywhere on \p FD.
+static bool hasAnyLifetimeBound(const FunctionDecl *FD) {
+  if (getImplicitObjectParamLifetimeBoundAttr(FD))
+    return true;
+  const FunctionDecl *Merged = getDeclWithMergedLifetimeBoundAttrs(FD);
+  return llvm::any_of(Merged->parameters(), [](const ParmVarDecl *PVD) {
+    return PVD->hasAttr<LifetimeBoundAttr>();
+  });
+}
+
+/// Fills the elided return slots of \p MD from the implicit object parameter.
+///
+/// This is Crubit's elision rule for methods: an output lifetime that is not
+/// written takes the lifetime of `this`. It is sound, because `this` can never
+/// outlive the object's own lifetime parameters, so tying the result to `this`
+/// never admits more than the class allows. It is conservative for view types,
+/// where an accessor really returns something that lives as long as one of the
+/// class's parameters; such accessors are expected to say so, and
+/// `-Wlifetime-safety-named-lifetime-suggestions` points them out.
+///
+/// It is applied only within classes that declare `LIFETIME_PARAMS`, so code
+/// that has not opted into named lifetimes keeps its meaning. A method that
+/// uses `lifetimebound` is left alone too: the attribute already describes the
+/// result, and overriding it here would silently change what it means.
+static void applyThisElision(const ASTContext &Ctx, const CXXMethodDecl *MD,
+                             LifetimeSignature &Sig) {
+  if (Sig.FunctionType.empty() || hasAnyLifetimeBound(MD))
+    return;
+  unsigned Slots = countLifetimeSlots(Ctx, MD->getReturnType());
+  if (Slots == 0)
+    return;
+  Sig.Return.resize(std::max<size_t>(Sig.Return.size(), Slots),
+                    LifetimeVar::elided());
+  if (llvm::none_of(Sig.Return,
+                    [](const LifetimeVar &LV) { return LV.isElided(); })) {
+    return;
+  }
+  // The elided lifetimes need something to name. If `this` has no written
+  // lifetime of its own, give it one.
+  LifetimeVar &ThisLifetime = Sig.FunctionType.front();
+  if (ThisLifetime.isElided())
+    ThisLifetime = LifetimeVar(ImplicitThisLifetimeName);
+  Sig.ReturnElidedToThis = Sig.Return.front().isElided();
+  for (LifetimeVar &LV : Sig.Return)
+    if (LV.isElided())
+      LV = ThisLifetime;
+}
+
 LifetimeSignature getLifetimeSignature(const ASTContext &Ctx,
                                        const FunctionDecl *FD) {
   LifetimeSignature Sig;
@@ -782,6 +846,7 @@ LifetimeSignature getLifetimeSignature(const ASTContext &Ctx,
     if (const FunctionDecl *Pattern = FD->getTemplateInstantiationPattern())
       Found = ScanRedecls(Pattern);
 
+  const bool HasWrittenSignature = Found.has_value();
   if (Found) {
     Sig.FunctionType = std::move(Found->FunctionType);
     Sig.Return = std::move(Found->Return);
@@ -790,34 +855,60 @@ LifetimeSignature getLifetimeSignature(const ASTContext &Ctx,
     Sig.Params.resize(FD->getNumParams());
   }
 
-  // On a member function that carries lifetime annotations, lifetime
-  // parameters declared on the enclosing class are in scope and occupy the
-  // inner levels of the implicit object parameter (`Class *`).
-  if (!Sig.empty()) {
-    if (const auto *MD = dyn_cast<CXXMethodDecl>(FD)) {
-      if (const CXXRecordDecl *RD = MD->getParent()->getDefinition()) {
-        LifetimeList ClassParams = getDeclaredLifetimeParams(Ctx, RD);
-        if (!ClassParams.empty()) {
-          for (const LifetimeVar &LV : Sig.Declared)
-            if (!llvm::is_contained(ClassParams, LV))
-              ClassParams.push_back(LV);
-          Sig.Declared = std::move(ClassParams);
+  // This is the only place where a class's `LIFETIME_PARAMS` enter the
+  // signature of one of its members. Everything downstream (scope checking,
+  // placeholder loans in the body, substitution at call sites) reads them from
+  // here, so the definition and its callers cannot disagree about them.
+  //
+  // The class's lifetimes are a property of the member's context, not of
+  // anything written on the member, so they apply whether or not the member
+  // itself is annotated.
+  LifetimeList ClassParams = getEnclosingClassLifetimeParams(Ctx, FD);
+  if (ClassParams.empty())
+    return Sig;
 
-          if (isa<CXXConstructorDecl>(FD) && Sig.Return.empty()) {
-            Sig.Return = getDeclaredLifetimeParams(Ctx, RD);
-          } else if (MD->isInstance() && !isa<CXXConstructorDecl>(FD) &&
-                     Sig.FunctionType.size() <= 1) {
-            if (Sig.FunctionType.empty())
-              Sig.FunctionType.push_back(LifetimeVar::elided());
-            LifetimeList OwnClassParams = getDeclaredLifetimeParams(Ctx, RD);
-            Sig.FunctionType.append(OwnClassParams.begin(),
-                                    OwnClassParams.end());
-          }
-        }
-      }
-    }
+  // Class parameters are in scope for every member, ahead of the member's own.
+  LifetimeList Declared = ClassParams;
+  for (const LifetimeVar &LV : Sig.Declared)
+    if (!llvm::is_contained(Declared, LV))
+      Declared.push_back(LV);
+  Sig.Declared = std::move(Declared);
+
+  const auto *MD = cast<CXXMethodDecl>(FD);
+  if (!MD->isInstance())
+    return Sig;
+
+  // The implicit object parameter has type `Class *`. Its outer level is the
+  // pointer, which is what a lifetime written after the parameter list names;
+  // the class's own slots are the levels beneath it. A list that already
+  // overflows the pointer level has been diagnosed and is left alone rather
+  // than given a second, conflicting shape.
+  if (Sig.FunctionType.size() <= 1) {
+    if (Sig.FunctionType.empty())
+      Sig.FunctionType.push_back(LifetimeVar::elided());
+    Sig.FunctionType.append(ClassParams.begin(), ClassParams.end());
   }
+
+  // A constructor yields an object of the class type, whose slots are exactly
+  // the class's parameters. This only means something when some argument is
+  // written with one of those lifetimes: otherwise the binding is vacuous and
+  // would merely displace `lifetimebound`, which still describes the call.
+  if (isa<CXXConstructorDecl>(MD)) {
+    if (HasWrittenSignature && Sig.Return.empty())
+      Sig.Return = ClassParams;
+    return Sig;
+  }
+
+  applyThisElision(Ctx, MD, Sig);
   return Sig;
+}
+
+LifetimeList getEnclosingClassLifetimeParams(const ASTContext &Ctx,
+                                             const FunctionDecl *FD) {
+  const auto *MD = dyn_cast_if_present<CXXMethodDecl>(FD);
+  if (!MD)
+    return {};
+  return getDeclaredLifetimeParams(Ctx, MD->getParent()->getDefinition());
 }
 
 bool haveSameWrittenLifetimes(const LifetimeSignature &A,

@@ -206,3 +206,124 @@ int* $a read_second_bad(PairWithFields $2(a, b) p) {
 }
 
 
+//===----------------------------------------------------------------------===//
+// Fields of `*this` are held to the lifetimes their types declare
+//===----------------------------------------------------------------------===//
+//
+// A member function can leave a value behind in a field as well as return it.
+// What a field holds when the function returns must satisfy the field's type,
+// under the same rules as a return. A constructor is blamed at the field's
+// initializer when it writes one; otherwise the function itself is blamed,
+// since the analysis does not record which store left the value there.
+
+struct LIFETIME_PARAMS("a") Holder {
+  int* $a p; // expected-note 3 {{field 'p' declared here}}
+
+  Holder(int* $a q) : p(q) {}
+  Holder(int* q, int) : p(q) {} // Unannotated: nothing to compare against.
+
+  LIFETIME_PARAMS("b")
+  Holder(int* $b q, char) : p(q) {} // expected-warning {{field 'p' may be left holding a value borrowed from lifetime 'b', but its type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+
+  LIFETIME_PARAMS("b")
+  Holder(int* $b q, long) { p = q; } // expected-warning {{field 'p' may be left holding a value borrowed from lifetime 'b', but its type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+
+  void set_ok(int* $a q) { p = q; }
+  void untouched() {}
+
+  // Not only constructors: any member function that stores into a field.
+  LIFETIME_PARAMS("b")
+  void set_bad(int* $b q) { p = q; } // expected-warning {{field 'p' may be left holding a value borrowed from lifetime 'b', but its type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+
+  // Overwriting the field on every path discharges the earlier store.
+  LIFETIME_PARAMS("b")
+  void set_then_reset(int* $b q, int* $a r) {
+    p = q;
+    p = r;
+  }
+
+  // A destructor leaves nothing behind.
+  ~Holder() { p = nullptr; }
+};
+
+// The contract applies at every level of the field's type.
+struct LIFETIME_PARAMS("a", "b") DeepHolder {
+  int* $b * $a pp; // expected-note {{field 'pp' declared here}}
+
+  DeepHolder(int* $b * $a x) : pp(x) {}
+
+  LIFETIME_PARAMS("c")
+  DeepHolder(int* $c * $a x, int) : pp(x) {} // expected-warning {{field 'pp' may be left holding a value borrowed from lifetime 'c', but its type declares lifetime 'b'}} // expected-note {{this would be allowed if lifetime 'c' were declared to outlive lifetime 'b', which cannot currently be expressed}}
+};
+
+//===----------------------------------------------------------------------===//
+// Aggregate initialization and member access
+//===----------------------------------------------------------------------===//
+//
+// A class's lifetimes are assembled from the initializers of the fields that
+// name them. Initializers for base classes come first in the list and are
+// skipped: base class lifetimes are not tracked through a derived class (see
+// the diagnostic in named-lifetimes.cpp).
+
+struct LIFETIME_PARAMS("a") AggBase { int* $a bp; };
+struct LIFETIME_PARAMS("a") AggDerived : AggBase { int* $a dp; };
+
+LIFETIME_PARAMS("a", "b")
+AggDerived $a agg_derived_bad(int* $a x, int* $b y) {
+  return AggDerived{{x}, y}; // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+}
+
+LIFETIME_PARAMS("a", "b")
+AggDerived $a agg_derived_base_untracked(int* $a x, int* $b y) {
+  return AggDerived{{y}, x};
+}
+
+// A field inherited from a base names the base's lifetimes, not the derived
+// class's, so it is not read through the derived object's lifetimes.
+LIFETIME_PARAMS("a", "b")
+int* $a inherited_field_untracked(AggDerived $b d) { return d.bp; }
+
+LIFETIME_PARAMS("a", "b")
+int* $a own_field_bad(AggDerived $b d) {
+  return d.dp; // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+}
+
+// A union is initialized through its active member.
+union LIFETIME_PARAMS("a") AggUnion {
+  long l;
+  int* $a p;
+};
+
+LIFETIME_PARAMS("a", "b")
+AggUnion $a agg_union_bad(int* $b y) {
+  return AggUnion{.p = y}; // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+}
+
+//===----------------------------------------------------------------------===//
+// LIFETIME_PARAMS takes precedence over gsl::Pointer
+//===----------------------------------------------------------------------===//
+//
+// The gsl::Pointer heuristics assume a single borrowed origin and only follow
+// one-argument constructors. A class that declares its lifetimes is modelled by
+// them instead.
+
+struct [[gsl::Pointer]] LIFETIME_PARAMS("a", "b") GslPair {
+  int* $a x;
+  int* $b y;
+  GslPair(int* $a p, int* $b q) : x(p), y(q) {}
+  int* $a first() { return x; }
+};
+
+LIFETIME_PARAMS("a", "b")
+GslPair $2(a, b) gsl_pair_ok(int* $a p, int* $b q) { return GslPair(p, q); }
+
+// One mismatch is reported per return, though both lifetimes are swapped here.
+LIFETIME_PARAMS("a", "b")
+GslPair $2(a, b) gsl_pair_bad(int* $a p, int* $b q) {
+  return GslPair(q, p); // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+}
+
+LIFETIME_PARAMS("a", "b", "c")
+int* $a gsl_pair_first_bad(GslPair $2(b, c) g) {
+  return g.first(); // expected-warning {{returning a value borrowed from lifetime 'b', but the return type declares lifetime 'a'}} // expected-note {{this would be allowed if lifetime 'b' were declared to outlive lifetime 'a', which cannot currently be expressed}}
+}

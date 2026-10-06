@@ -207,3 +207,62 @@ void sv_pass_local() {
   sink_sv(make_sv(&x)); // viol-warning {{argument is not known to live forever, but parameter 's' declares lifetime 'static'}}
 }
 
+// A field declaring `$static` imposes the same demand on what a member
+// function leaves in it.
+struct LIFETIME_PARAMS("a") StaticField {
+  int* $static s; // viol-note {{field 's' declared here}}
+  int* $a p;
+
+  StaticField(int* $static q) : s(q), p(nullptr) {}
+  StaticField(int* $unknown q, int) : s(q), p(nullptr) {}
+  StaticField(char) : s(&g), p(nullptr) {}
+  StaticField(int* $a q, long) : s(q), p(q) {} // viol-warning {{field 's' may be left holding a value borrowed from this function's caller, but its type declares lifetime 'static'}}
+};
+
+//===----------------------------------------------------------------------===//
+// Distinguished lifetimes as class arguments
+//===----------------------------------------------------------------------===//
+//
+// Each lifetime slot of a class type is judged on its own, wherever the
+// distinguished name appears in the argument list.
+
+#define $2(l1, l2) [[clang::annotate_type("lifetime", #l1, #l2)]]
+
+struct LIFETIME_PARAMS("a", "b") StaticPair {
+  int* $a x;
+  int* $(b) y;
+};
+
+LIFETIME_PARAMS("a")
+int* $static static_slot_second(StaticPair $2(a, static) p) { return p.y; }
+
+LIFETIME_PARAMS("a")
+int* $static named_slot_first(StaticPair $2(a, static) p) {
+  return p.x; // viol-warning {{returning a value borrowed from this function's caller, but the return type declares lifetime 'static'}}
+}
+
+LIFETIME_PARAMS("a")
+int* $static static_slot_first(StaticPair $2(static, a) p) { return p.x; }
+
+LIFETIME_PARAMS("a")
+int* $static named_slot_second(StaticPair $2(static, a) p) {
+  return p.y; // viol-warning {{returning a value borrowed from this function's caller, but the return type declares lifetime 'static'}}
+}
+
+LIFETIME_PARAMS("a")
+int* $static unknown_slot(StaticPair $2(a, unknown) p) { return p.y; }
+
+// viol-note@+2 {{parameter declares lifetime 'static' here}}
+LIFETIME_PARAMS("a")
+void wants_second_static(StaticPair $2(a, static) p);
+// viol-note@+2 {{parameter declares lifetime 'static' here}}
+LIFETIME_PARAMS("a")
+void wants_first_static(StaticPair $2(static, a) p);
+
+void pass_static_slots() {
+  int l = 0;
+  wants_second_static(StaticPair{&l, &g});
+  wants_second_static(StaticPair{&g, &l}); // viol-warning {{argument is not known to live forever, but parameter 'p' declares lifetime 'static'}}
+  wants_first_static(StaticPair{&g, &l});
+  wants_first_static(StaticPair{&l, &g}); // viol-warning {{argument is not known to live forever, but parameter 'p' declares lifetime 'static'}}
+}

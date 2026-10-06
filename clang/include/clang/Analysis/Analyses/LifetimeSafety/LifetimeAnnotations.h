@@ -173,6 +173,14 @@ inline constexpr llvm::StringLiteral LifetimeAnnotationCategory = "lifetime";
 inline constexpr llvm::StringLiteral LifetimeParamsAnnotationCategory =
     "lifetime_params";
 
+/// The name given to the lifetime of the implicit object parameter when a
+/// member function needs one for elision but none was written.
+///
+/// It is reserved -- `LIFETIME_PARAMS("this")` is diagnosed like `"static"` --
+/// so it cannot collide with a user's lifetime, and it reads naturally in
+/// diagnostics ("lifetime 'this'").
+inline constexpr llvm::StringLiteral ImplicitThisLifetimeName = "this";
+
 /// A single lifetime as written in an annotation, e.g. the `a` of `$a`.
 ///
 /// Two names are distinguished: `$static` denotes storage that outlives
@@ -255,6 +263,13 @@ struct LifetimeSignature {
   /// Lifetimes written on each explicit parameter, indexed by parameter.
   llvm::SmallVector<LifetimeList, 4> Params;
 
+  /// Whether the outermost return lifetime was not written but supplied by
+  /// elision from the implicit object parameter (`FunctionType.front()`).
+  ///
+  /// This happens only for members of a class with `LIFETIME_PARAMS`; see
+  /// `getLifetimeSignature`.
+  bool ReturnElidedToThis = false;
+
   /// Whether any lifetime annotation at all was written on this function.
   bool empty() const;
 
@@ -283,10 +298,21 @@ LifetimeList getExplicitLifetimes(const ASTContext &Ctx, QualType QT);
 /// so only the first `LIFETIME_PARAMS` on a declaration survives to here.
 LifetimeList getDeclaredLifetimeParams(const ASTContext &Ctx, const Decl *D);
 
-/// Computes the lifetime signature written on \p FD.
+/// Reads the lifetimes declared by `LIFETIME_PARAMS(...)` on the class that
+/// encloses \p FD, or returns an empty list if \p FD is not a member.
+LifetimeList getEnclosingClassLifetimeParams(const ASTContext &Ctx,
+                                             const FunctionDecl *FD);
+
+/// Computes the lifetime signature of \p FD.
 ///
 /// Annotations on types do not merge across redeclarations, so all
 /// redeclarations (and the template instantiation pattern) are scanned.
+///
+/// For a member of a class with `LIFETIME_PARAMS`, the result always includes
+/// the class's parameters, whether or not the member is annotated: they lead
+/// `Declared`, and for an instance member they occupy the inner levels of
+/// `FunctionType` (the implicit object parameter `Class *`). This is the only
+/// place that injects them, so every consumer sees the same signature.
 LifetimeSignature getLifetimeSignature(const ASTContext &Ctx,
                                        const FunctionDecl *FD);
 

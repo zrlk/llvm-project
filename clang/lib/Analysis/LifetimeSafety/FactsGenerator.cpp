@@ -202,8 +202,22 @@ void FactsGenerator::VisitDeclRefExpr(const DeclRefExpr *DRE) {
   }
 }
 
+/// Whether \p QT should be modelled by the `gsl::Pointer` heuristics.
+///
+/// A class that declares `LIFETIME_PARAMS` is modelled by those parameters
+/// even if it is also a `gsl::Pointer`: its constructors and members carry
+/// named signatures, while the heuristics assume a single borrowed origin and
+/// handle only one-argument constructors.
+static bool isHeuristicGslPointerType(const ASTContext &Ctx, QualType QT) {
+  if (!isGslPointerType(QT))
+    return false;
+  const CXXRecordDecl *RD = QT->getAsCXXRecordDecl();
+  const CXXRecordDecl *Def = RD ? RD->getDefinition() : nullptr;
+  return !Def || getDeclaredLifetimeParams(Ctx, Def).empty();
+}
+
 void FactsGenerator::VisitCXXConstructExpr(const CXXConstructExpr *CCE) {
-  if (isGslPointerType(CCE->getType())) {
+  if (isHeuristicGslPointerType(AC.getASTContext(), CCE->getType())) {
     handleGSLPointerConstruction(CCE);
     return;
   }
@@ -247,7 +261,7 @@ void FactsGenerator::handleCXXCtorInitializer(const CXXCtorInitializer *CII) {
 void FactsGenerator::VisitCXXMemberCallExpr(const CXXMemberCallExpr *MCE) {
   // Specifically for conversion operators,
   // like `std::string_view p = std::string{};`
-  if (isGslPointerType(MCE->getType()) &&
+  if (isHeuristicGslPointerType(AC.getASTContext(), MCE->getType()) &&
       isa_and_present<CXXConversionDecl>(MCE->getCalleeDecl()) &&
       isGslOwnerType(MCE->getImplicitObjectArgument()->getType())) {
     handleFunctionCall(MCE, /*IsGslConstruction=*/true);
@@ -283,8 +297,30 @@ void FactsGenerator::VisitMemberExpr(const MemberExpr *ME) {
   if (!isa<CXXThisExpr>(Base->IgnoreParenImpCasts()) && Dst && Src) {
     ASTContext &Ctx = AC.getASTContext();
     LifetimeList FieldLifetimes = getExplicitLifetimes(Ctx, FD->getType());
-    if (!FieldLifetimes.empty()) {
-      const RecordDecl *RD = FD->getParent();
+    // The base's origins are laid out by the base expression's own record
+    // type. Only substitute when the field is declared directly in that record;
+    // a field inherited from a base class refers to the base class's
+    // parameters, whose origins are not tracked through the derived type.
+    // Look through derived-to-base conversions, which Sema inserts when the
+    // field is inherited: what matters is the record the origins belong to.
+    const Expr *ObjExpr = Base->IgnoreParens();
+    while (const auto *CE = dyn_cast<CastExpr>(ObjExpr)) {
+      if (CE->getCastKind() != CK_DerivedToBase &&
+          CE->getCastKind() != CK_UncheckedDerivedToBase &&
+          CE->getCastKind() != CK_NoOp &&
+          CE->getCastKind() != CK_LValueToRValue)
+        break;
+      ObjExpr = CE->getSubExpr()->IgnoreParens();
+    }
+    QualType BaseTy = ObjExpr->getType();
+    if (ME->isArrow())
+      BaseTy = BaseTy->getPointeeType();
+    const RecordDecl *BaseRD =
+        BaseTy.isNull() ? nullptr : BaseTy->getAsRecordDecl();
+    const RecordDecl *RD = FD->getParent();
+    bool FieldOfBaseRecord =
+        BaseRD && BaseRD->getCanonicalDecl() == RD->getCanonicalDecl();
+    if (!FieldLifetimes.empty() && FieldOfBaseRecord) {
       LifetimeList ClassParams = getDeclaredLifetimeParams(Ctx, RD);
       OriginList *BaseParams =
           ME->isArrow() || Base->isGLValue() ? Src->peelOuterOrigin() : Src;
@@ -294,6 +330,10 @@ void FactsGenerator::VisitMemberExpr(const MemberExpr *ME) {
         if (!FieldValue)
           break;
         if (LV.getKind() == LifetimeVar::Kind::Named) {
+          // Walk the base's parameter origins in declaration order. If the
+          // base has fewer origin levels than the class declares parameters
+          // (which should not happen for a well-formed record), leave the
+          // remaining slots unsubstituted rather than asserting.
           OriginList *Slot = BaseParams;
           for (const LifetimeVar &Param : ClassParams) {
             if (!Slot)
@@ -647,11 +687,28 @@ void FactsGenerator::VisitInitListExpr(const InitListExpr *ILE) {
       if (!ClassParams.empty()) {
         llvm::SmallDenseMap<llvm::StringRef, llvm::SmallVector<OriginID, 2>, 4>
             ByLifetime;
-        unsigned InitIdx = 0;
-        for (const FieldDecl *Field : Def->fields()) {
-          if (InitIdx >= ILE->getNumInits())
-            break;
-          const Expr *Init = ILE->getInit(InitIdx++);
+        // Pair each field with its initializer. In aggregate initialization,
+        // initializers for direct base classes come first, followed by one
+        // initializer per named field; a union has a single initializer for
+        // its active member. Base class parameters are not propagated through
+        // the derived type, so base initializers are skipped.
+        llvm::SmallVector<std::pair<const FieldDecl *, const Expr *>, 4>
+            FieldInits;
+        if (Def->isUnion()) {
+          if (const FieldDecl *Active = ILE->getInitializedFieldInUnion();
+              Active && ILE->getNumInits() == 1)
+            FieldInits.push_back({Active, ILE->getInit(0)});
+        } else {
+          unsigned InitIdx = Def->getNumBases();
+          for (const FieldDecl *Field : Def->fields()) {
+            if (Field->isUnnamedBitField())
+              continue;
+            if (InitIdx >= ILE->getNumInits())
+              break;
+            FieldInits.push_back({Field, ILE->getInit(InitIdx++)});
+          }
+        }
+        for (auto [Field, Init] : FieldInits) {
           if (!Init)
             continue;
           LifetimeList FieldLifetimes =
@@ -679,6 +736,9 @@ void FactsGenerator::VisitInitListExpr(const InitListExpr *ILE) {
           }
           ResultLevel = ResultLevel->peelOuterOrigin();
         }
+        // The generic single-element handling below must not run as well: it
+        // would flow the first initializer's origins into the first slot
+        // regardless of which lifetime that field actually names.
         return;
       }
     }
@@ -1299,12 +1359,14 @@ void FactsGenerator::handleFunctionCall(const Expr *Call,
     flow(CallList, getOriginsList(*Args[0]), /*Kill=*/true);
     return;
   }
-  auto shouldTrackPointerImplicitObjectArg = [FD, &Args](unsigned I) -> bool {
+  auto shouldTrackPointerImplicitObjectArg = [this, FD,
+                                              &Args](unsigned I) -> bool {
     const auto *Method = dyn_cast<CXXMethodDecl>(FD);
     if (!Method || !Method->isInstance())
       return false;
     return I == 0 &&
-           isGslPointerType(Method->getFunctionObjectParameterType()) &&
+           isHeuristicGslPointerType(
+               AC.getASTContext(), Method->getFunctionObjectParameterType()) &&
            shouldTrackImplicitObjectArg(*Args[0], Method,
                                         /*RunningUnderLifetimeSafety=*/true);
   };
@@ -1449,35 +1511,25 @@ llvm::SmallVector<Fact *> FactsGenerator::issuePlaceholderLoans() {
     PlaceholderLoanFacts.push_back(
         FactMgr.createFact<IssueFact>(L->getID(), List->getOuterOriginID()));
     // Lifetimes written after the parameter list belong to the implicit
-    // object parameter (and for a class with `LIFETIME_PARAMS`, its inner
-    // levels carry the class's lifetime parameters).
+    // object parameter. For a class with `LIFETIME_PARAMS`, the signature
+    // also places the class's parameters on its inner levels.
     issueNamedLoans(Sig.FunctionType, List);
 
-    if (const CXXRecordDecl *RD = MD->getParent()->getDefinition()) {
+    // `this->field` shares origins with the `FieldDecl`, so issue any named
+    // loans written on the field's type directly onto the field's origins.
+    // Constructors initialize the fields rather than reading them from an
+    // already-constructed object, so skip issuing pre-existing field loans
+    // there.
+    if (const CXXRecordDecl *RD = MD->getParent()->getDefinition();
+        RD && !isa<CXXConstructorDecl>(MD)) {
       ASTContext &Ctx = AC.getASTContext();
-      // If the method had no signature of its own, `Sig.FunctionType` is empty,
-      // so issue the enclosing class's lifetime parameters onto the inner
-      // levels of `ThisOrigins` directly.
-      if (Sig.FunctionType.empty()) {
-        LifetimeList ClassParams = getDeclaredLifetimeParams(Ctx, RD);
-        if (!ClassParams.empty())
-          issueNamedLoans(ClassParams, List->peelOuterOrigin());
-      }
-
-      // `this->field` shares origins with the `FieldDecl`, so issue any named
-      // loans written on the field's type directly onto the field's origins.
-      // Constructors initialize the fields rather than reading them from an
-      // already-constructed object, so skip issuing pre-existing field loans
-      // there.
-      if (!isa<CXXConstructorDecl>(MD)) {
-        for (const FieldDecl *Field : RD->fields()) {
-          LifetimeList FieldLifetimes =
-              getExplicitLifetimes(Ctx, Field->getType());
-          if (FieldLifetimes.empty())
-            continue;
-          if (OriginList *FieldList = getOriginsList(*Field))
-            issueNamedLoans(FieldLifetimes, FieldList);
-        }
+      for (const FieldDecl *Field : RD->fields()) {
+        LifetimeList FieldLifetimes =
+            getExplicitLifetimes(Ctx, Field->getType());
+        if (FieldLifetimes.empty())
+          continue;
+        if (OriginList *FieldList = getOriginsList(*Field))
+          issueNamedLoans(FieldLifetimes, FieldList);
       }
     }
   }

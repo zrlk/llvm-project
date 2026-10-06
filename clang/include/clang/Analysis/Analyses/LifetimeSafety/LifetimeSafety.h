@@ -62,6 +62,11 @@ struct LifetimeSafetyOpts {
   /// Whether to suggest `lifetimebound` on a parameter that shares the return
   /// type's named lifetime but is not marked.
   bool SuggestNamedLifetimebound;
+
+  /// Whether to suggest annotating the return type of a member function whose
+  /// return lifetime elision ties to `this`, when everything it returns is
+  /// borrowed from one of the class's lifetimes.
+  bool SuggestNamedReturnLifetime;
 };
 
 /// Enum to track functions visible across or within TU.
@@ -198,8 +203,10 @@ public:
                                            unsigned Found, unsigned Expected) {}
 
   /// Reports a lifetime that is used but never introduced by `LIFETIME_PARAMS`.
+  /// \p InClass is set when the use is on a field, whose only lifetimes are
+  /// those its class declares.
   virtual void reportUndeclaredLifetime(SourceLocation Loc,
-                                        llvm::StringRef Name) {}
+                                        llvm::StringRef Name, bool InClass) {}
 
   /// Reports a lifetime written after the parameter list, where it attaches to
   /// the function type and is therefore ignored.
@@ -213,6 +220,17 @@ public:
   /// Reports a second `LIFETIME_PARAMS` on the same declaration.
   virtual void reportRepeatedLifetimeParams(SourceLocation Loc,
                                             SourceLocation PrevLoc) {}
+
+  /// Reports a direct base class of \p Derived that declares
+  /// `LIFETIME_PARAMS`. The analysis does not yet map a derived object's
+  /// origins onto its bases' parameters, so the base's fields are untracked.
+  virtual void reportLifetimeParamsBase(SourceLocation Loc, QualType Base,
+                                        const CXXRecordDecl *Derived) {}
+
+  /// Reports a lifetime annotation written inside a template argument, as in
+  /// `View<int *$a>`. Specializations are keyed on canonical arguments, so the
+  /// annotation does not reach the specialization's fields and is ignored.
+  virtual void reportLifetimeInTemplateArgument(SourceLocation Loc) {}
 
   /// Reports an annotation argument that is not a string literal, which
   /// includes template-dependent arguments: Clang does not substitute
@@ -248,6 +266,26 @@ public:
   /// object argument.
   virtual void reportStaticArgumentViolation(const Expr *ArgExpr,
                                              const ParmVarDecl *PVD) {}
+
+  /// Reports a field of `*this` that may hold, when a member function returns,
+  /// a value borrowed from lifetime \p Found where the field's type declares
+  /// \p Required. \p Loc is the field's initializer in a constructor that
+  /// writes one, and otherwise the member function.
+  virtual void reportFieldLifetimeViolation(SourceLocation Loc,
+                                            const FieldDecl *Field,
+                                            llvm::StringRef Found,
+                                            llvm::StringRef Required) {}
+
+  /// Suggests annotating the return type of \p FD, a member function whose
+  /// return lifetime elision tied to `this`, with the class lifetime \p
+  /// Lifetime that everything it returns is borrowed from.
+  virtual void suggestReturnLifetimeFromClass(const FunctionDecl *FD,
+                                              llvm::StringRef Lifetime) {}
+
+  /// Reports a field of `*this` declaring `$static` that may hold, when a
+  /// member function returns, a value borrowed from the caller's storage.
+  virtual void reportStaticFieldViolation(SourceLocation Loc,
+                                          const FieldDecl *Field) {}
 
   /// Reports a parameter marked `lifetimebound` -- asserting the result may
   /// borrow from it -- whose named lifetime differs from the one the return

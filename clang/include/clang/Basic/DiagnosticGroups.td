@@ -710,6 +710,11 @@ matches the one declared by the return type. Such a parameter is already
 understood by the lifetime signature, but tools that only read
 [[clang::lifetimebound]] -- including Clang's own -Wdangling -- cannot see the
 relationship without the attribute.
+
+Also suggests annotating the return type of a member function of a class with
+lifetime parameters when its return lifetime is elided -- and so tied to the
+object -- but everything it returns is borrowed from one of the class's
+lifetimes, which would let callers keep the result after the object is gone.
   }];
 }
 
