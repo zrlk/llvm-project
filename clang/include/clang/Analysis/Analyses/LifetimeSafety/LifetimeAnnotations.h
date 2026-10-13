@@ -210,6 +210,9 @@ public:
     return LV;
   }
 
+  /// The distinguished `$unknown` lifetime, as if it had been written.
+  static LifetimeVar unknown() { return LifetimeVar("unknown"); }
+
   Kind getKind() const { return K; }
   bool isStatic() const { return K == Kind::Static; }
   bool isUnknown() const { return K == Kind::Unknown; }

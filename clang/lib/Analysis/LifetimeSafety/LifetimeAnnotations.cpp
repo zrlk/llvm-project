@@ -673,8 +673,20 @@ LifetimeList getExplicitLifetimes(const ASTContext &Ctx, QualType QT) {
     // an annotation on an inner level would be attributed to an outer one, and
     // the ill-formed `int **$a $b` would silently acquire the meaning of the
     // well-formed `int *$a *$b`. The excess is diagnosed in SignatureCheck.
-    Result.resize(LevelStart + getLifetimeSlotsAtLevel(Ctx, QT),
-                  LifetimeVar::elided());
+    //
+    // A level that is only partly written is ill-formed too, but it is not
+    // always diagnosed: a template that writes `T $e` is fine for a `T` with
+    // one slot and silently short for one with two, and well-formedness is
+    // not checked in instantiations. Its missing slots become `$unknown`
+    // rather than elided. An elided slot means "nothing was written here" and
+    // may be filled in by elision; in a member of a `LIFETIME_PARAMS` class
+    // that ties it to `this`, which invents a borrow of the object that the
+    // author never asked for. `$unknown` contributes no flow and no contract,
+    // so the slot goes untracked rather than mis-tracked.
+    const unsigned Slots = getLifetimeSlotsAtLevel(Ctx, QT);
+    const size_t Written = Result.size() - LevelStart;
+    Result.resize(LevelStart + Slots, Written == 0 ? LifetimeVar::elided()
+                                                   : LifetimeVar::unknown());
 
     if (!QT->isPointerOrReferenceType())
       break;

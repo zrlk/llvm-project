@@ -395,16 +395,33 @@ void pair_elements_first_slot() {
   use(*r); // expected-note {{later used here}}
 }
 
-// FIXME: the second slot is not tracked: the dangling `b` is reported as a
-// borrow of the vector instead. An arity mismatch (`Pair` takes two
-// lifetimes, one was written) should be diagnosed at instantiation.
+// FIXME: the second slot is not tracked. `Pair $e` is short by one lifetime;
+// in a non-template that is diagnosed, but well-formedness is not checked in
+// instantiations. The unwritten slot is treated as `$unknown`, so the
+// constructor drops `b` and `front().y` borrows nothing: the dangle is
+// missed. An arity mismatch (`Pair` takes two lifetimes, one was written)
+// should be diagnosed at instantiation; the real fix is a way to say
+// "whatever lifetimes T has" (template_arg_lifetimes_plan.md).
 void pair_elements_second_slot() {
   const int* r;
   {
     static int a;
     int b = 0;
     Vector<Pair> v(1, Pair{&a, &b});
-    r = v.front().y; // expected-warning {{local variable 'v' does not live long enough}} expected-note {{result of call to 'front' aliases the storage of local variable 'v'}}
-  } // expected-note {{local variable 'v' is destroyed here}}
-  use(*r); // expected-note {{later used here}}
+    r = v.front().y;
+  }
+  use(*r);
+}
+
+// The unwritten slot must not be filled in by `$this` elision either: that
+// would make `front().y` appear to borrow the vector, and `y` pointing to
+// static storage would be reported once the vector is gone.
+void pair_elements_second_slot_no_false_borrow() {
+  static int a, b;
+  const int* r;
+  {
+    Vector<Pair> v(1, Pair{&a, &b});
+    r = v.front().y;
+  }
+  use(*r);
 }
