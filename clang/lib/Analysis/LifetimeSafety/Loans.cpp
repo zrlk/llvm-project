@@ -23,6 +23,8 @@ void AccessPath::dump(llvm::raw_ostream &OS) const {
       OS << "$this";
     else if (const auto *NL = PB->getNamedLifetime())
       OS << "$'" << NL->getName();
+    else if (const auto *FD = PB->getFieldDecl())
+      OS << "$this." << FD->getNameAsString();
   } else if (const auto *E = getAsNewAllocation())
     OS << "NewAllocation at " << E;
   else
@@ -75,6 +77,20 @@ LoanManager::getOrCreatePlaceholderBase(const NamedLifetime *NL) {
 
   void *Mem = LoanAllocator.Allocate<PlaceholderBase>();
   PlaceholderBase *NewPB = new (Mem) PlaceholderBase(NL);
+  PlaceholderBases.insert(NewPB, InsertToken);
+  return NewPB;
+}
+
+const PlaceholderBase *
+LoanManager::getOrCreatePlaceholderBase(const FieldDecl *FD) {
+  llvm::FoldingSetNodeID ID;
+  PlaceholderBase::Profile(ID, FD);
+  llvm::FoldingSetInsertToken InsertToken;
+  if (PlaceholderBase *Existing = PlaceholderBases.lookup(ID, InsertToken))
+    return Existing;
+
+  void *Mem = LoanAllocator.Allocate<PlaceholderBase>();
+  PlaceholderBase *NewPB = new (Mem) PlaceholderBase(FD);
   PlaceholderBases.insert(NewPB, InsertToken);
   return NewPB;
 }

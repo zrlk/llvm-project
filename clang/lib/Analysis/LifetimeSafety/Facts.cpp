@@ -175,6 +175,14 @@ void StaticObligationFact::dump(llvm::raw_ostream &OS, const LoanManager &,
   OS << ")\n";
 }
 
+void ThisEscapeFact::dump(llvm::raw_ostream &OS, const LoanManager &,
+                          const OriginManager &OM,
+                          const LoanPropagationAnalysis *) const {
+  OS << "OriginEscapes (";
+  OM.dump(getEscapedOriginID(), OS);
+  OS << ", via This)\n";
+}
+
 void UseFact::dump(llvm::raw_ostream &OS, const LoanManager &,
                    const OriginManager &OM,
                    const LoanPropagationAnalysis *) const {

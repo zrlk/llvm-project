@@ -86,33 +86,39 @@ public:
 };
 
 /// Represents the base of a placeholder access path: a function parameter, the
-/// implicit 'this' object of an instance method, or a named lifetime.
-/// Placeholder paths never expire within the function scope, as they represent
-/// storage from the caller's scope.
+/// implicit 'this' object of an instance method, a field of the enclosing
+/// class, or a named lifetime. Placeholder paths never expire within the
+/// function scope, as they represent storage from the caller's or object's
+/// scope.
 class PlaceholderBase : public llvm::FoldingSetNode {
   llvm::PointerUnion<const ParmVarDecl *, const CXXMethodDecl *,
-                     const NamedLifetime *>
+                     const FieldDecl *, const NamedLifetime *>
       Base;
 
 public:
   PlaceholderBase(const ParmVarDecl *PVD) : Base(PVD) {}
   PlaceholderBase(const CXXMethodDecl *MD) : Base(MD) {}
+  PlaceholderBase(const FieldDecl *FD) : Base(FD) {}
   PlaceholderBase(const NamedLifetime *NL) : Base(NL) {}
 
   const ParmVarDecl *getParmVarDecl() const {
-    return Base.dyn_cast<const ParmVarDecl *>();
+    return dyn_cast<const ParmVarDecl *>(Base);
   }
 
   const CXXMethodDecl *getImplicitThisParent() const {
-    return Base.dyn_cast<const CXXMethodDecl *>();
+    return dyn_cast<const CXXMethodDecl *>(Base);
+  }
+
+  const FieldDecl *getFieldDecl() const {
+    return dyn_cast<const FieldDecl *>(Base);
   }
 
   const NamedLifetime *getNamedLifetime() const {
-    return Base.dyn_cast<const NamedLifetime *>();
+    return dyn_cast<const NamedLifetime *>(Base);
   }
 
   using KeyTy = llvm::PointerUnion<const ParmVarDecl *, const CXXMethodDecl *,
-                                   const NamedLifetime *>;
+                                   const FieldDecl *, const NamedLifetime *>;
 
   static void Profile(llvm::FoldingSetNodeID &ID, KeyTy Base) {
     ID.AddPointer(Base.getOpaqueValue());
@@ -161,19 +167,19 @@ public:
   }
 
   const clang::ValueDecl *getAsValueDecl() const {
-    return Base.dyn_cast<const clang::ValueDecl *>();
+    return dyn_cast<const clang::ValueDecl *>(Base);
   }
 
   const clang::MaterializeTemporaryExpr *getAsMaterializeTemporaryExpr() const {
-    return Base.dyn_cast<const clang::MaterializeTemporaryExpr *>();
+    return dyn_cast<const clang::MaterializeTemporaryExpr *>(Base);
   }
 
   const PlaceholderBase *getAsPlaceholderBase() const {
-    return Base.dyn_cast<const PlaceholderBase *>();
+    return dyn_cast<const PlaceholderBase *>(Base);
   }
 
   const clang::CXXNewExpr *getAsNewAllocation() const {
-    return Base.dyn_cast<const clang::CXXNewExpr *>();
+    return dyn_cast<const clang::CXXNewExpr *>(Base);
   }
 
   bool operator==(const AccessPath &RHS) const {
@@ -265,6 +271,10 @@ public:
     return L;
   }
 
+  Loan *createPlaceholderLoan(const FieldDecl *FD) {
+    return createLoan(AccessPath(getOrCreatePlaceholderBase(FD)));
+  }
+
   const Loan *getLoan(LoanID ID) const {
     assert(ID.Value < AllLoans.size());
     return AllLoans[ID.Value];
@@ -275,7 +285,8 @@ public:
 private:
   LoanID getNextLoanID() { return NextLoanID++; }
 
-  /// Gets or creates a placeholder base for a given parameter or method.
+  /// Gets or creates a placeholder base for a given parameter, method, or
+  /// field.
   const PlaceholderBase *getOrCreatePlaceholderBase(const ParmVarDecl *PVD);
   const PlaceholderBase *getOrCreatePlaceholderBase(const CXXMethodDecl *MD);
   const PlaceholderBase *getOrCreatePlaceholderBase(const NamedLifetime *NL);
@@ -293,6 +304,8 @@ private:
     Entry->second = NamedLifetime(Entry->getKey());
     return &Entry->second;
   }
+
+  const PlaceholderBase *getOrCreatePlaceholderBase(const FieldDecl *FD);
 
   LoanID NextLoanID{0};
 
