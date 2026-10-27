@@ -865,10 +865,13 @@ void FactsGenerator::handleExitBlock() {
   // fields) is considered used after the method returns. This is emitted for
   // every method with a `this` origin, not only those that capture something.
   // Destructors are skipped since the object is being destroyed.
+  // Every level escapes: captures land in the object (`*this`), not in the
+  // `this` pointer.
   if (auto ThisOrigins = FactMgr.getOriginMgr().getThisOrigins();
       ThisOrigins && !IsDestructor)
-    EscapesInCurrentBlock.push_back(FactMgr.createFact<ThisEscapeFact>(
-        (*ThisOrigins)->getOuterOriginID(), AC.getDecl()->getEndLoc()));
+    for (OriginList *L = *ThisOrigins; L; L = L->peelOuterOrigin())
+      EscapesInCurrentBlock.push_back(FactMgr.createFact<ThisEscapeFact>(
+          L->getOuterOriginID(), AC.getDecl()->getEndLoc()));
 }
 
 void FactsGenerator::handleGSLPointerConstruction(const CXXConstructExpr *CCE) {
@@ -1071,6 +1074,13 @@ void FactsGenerator::handleLifetimeCaptureBy(const FunctionDecl *FD,
       OriginList *Dest = readValue(CapturedByArg);
       if (!Dest)
         continue;
+      // A pointer capturer (`this`, or a `T*` argument) refers to its pointee:
+      // the capture is stored in the pointed-to object, not in the pointer.
+      // A glvalue capturer has already been read down to the object's value.
+      if (CapturedByArg->isPRValue() &&
+          CapturedByArg->getType()->isPointerType())
+        if (OriginList *Pointee = Dest->peelOuterOrigin())
+          Dest = Pointee;
       // KillDest=false because we cannot know if previous captures are being
       // replaced or accumulated. Multiple successive captures into the same
       // destination must all be tracked, so captured lifetimes are always
