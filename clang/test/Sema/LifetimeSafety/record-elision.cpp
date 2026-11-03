@@ -70,3 +70,111 @@ struct Plain {
   int* own() { return &n; }
 };
 int* plain_caller(Plain& s) { return s.own(); }
+
+//===----------------------------------------------------------------------===//
+// The caller's half of the implied bound (D22). A result named with the
+// lifetime of `this` may borrow from any class lifetime of the object, so at
+// the call it borrows from what the object was built from as well as from the
+// object itself. Without this, reassigning the object to borrow a shorter-lived
+// local and reading through the accessor's result dangles unnoticed.
+//===----------------------------------------------------------------------===//
+
+void use(int);
+
+struct LIFETIME_PARAMS("a") Holder {
+  int* $a p;
+  int n;
+  Holder(int* $a q) : p(q) {} // suggest-warning {{parameter shares lifetime 'a' with the return type but is not marked 'lifetimebound'}}
+  int* get() { return p; }                           // suggest-warning {{return type of 'get' defaults to the lifetime of the object, but everything it returns is borrowed from lifetime 'a'; annotate the return type with lifetime 'a' to let callers rely on it}}
+  int* decl();                                       // declared only
+  int* either(bool c) { return c ? p : &n; }         // suggestion blocked
+  LIFETIME_PARAMS("t") int* $(t) named() $(t); // suggest-note {{return type declares lifetime 't' here}}
+  int* own() { return &n; }
+};
+int* Holder::named() { return p; } // suggest-warning {{the implicit object parameter shares lifetime 't' with the return type but is not marked 'lifetimebound'}}
+
+void elided_caller() {
+  int y = 0;
+  Holder h(&y);
+  int* r;
+  {
+    int x = 1;
+    h = Holder(&x); // viol-warning {{local variable 'x' does not live long enough}}
+    r = h.get();    // viol-note {{result of call to 'get' aliases the storage of local variable 'x'}}
+  } // viol-note {{destroyed here}}
+  use(*r); // viol-note {{later used here}}
+}
+
+// Only the declaration is visible, so there is no suggestion to heed.
+void declared_only_caller() {
+  int y = 0;
+  Holder h(&y);
+  int* r;
+  {
+    int x = 1;
+    h = Holder(&x); // viol-warning {{local variable 'x' does not live long enough}}
+    r = h.decl();   // viol-note {{result of call to 'decl' aliases the storage of local variable 'x'}}
+  } // viol-note {{destroyed here}}
+  use(*r); // viol-note {{later used here}}
+}
+
+// FIXME: assigning through a pointer does not reach the pointee's origins, so
+// this is missed even with `int* $a` on the result, and for a plain `hp->p`.
+void through_pointer_caller(Holder* hp) {
+  int* r;
+  {
+    int x = 1;
+    *hp = Holder(&x);
+    r = hp->decl();
+  }
+  use(*r);
+}
+
+// Borrowing from both, so the named-return suggestion is withheld.
+void mixed_caller() {
+  int y = 0;
+  Holder h(&y);
+  int* r;
+  {
+    int x = 1;
+    h = Holder(&x);     // viol-warning {{local variable 'x' does not live long enough}}
+    r = h.either(true); // viol-note {{result of call to 'either' aliases the storage of local variable 'x'}}
+  } // viol-note {{destroyed here}}
+  use(*r); // viol-note {{later used here}}
+}
+
+// The lifetime of `this` written out rather than elided: the same bound.
+void named_this_caller() {
+  int y = 0;
+  Holder h(&y);
+  int* r;
+  {
+    int x = 1;
+    h = Holder(&x); // viol-warning {{local variable 'x' does not live long enough}}
+    r = h.named();  // viol-note {{result of call to 'named' aliases the storage of local variable 'x'}}
+  } // viol-note {{destroyed here}}
+  use(*r); // viol-note {{later used here}}
+}
+
+// The signature cannot tell `own` from `get`, so the caller treats both alike;
+// Rust rejects the same program. Annotating `int* $a get()` is what lets a
+// caller keep a result longer than the object.
+void own_caller() {
+  int y = 0;
+  Holder h(&y);
+  int* r;
+  {
+    int x = 1;
+    h = Holder(&x); // viol-warning {{local variable 'x' does not live long enough}}
+    r = h.own();    // viol-note {{result of call to 'own' aliases the storage of local variable 'x'}}
+  } // viol-note {{destroyed here}}
+  use(*r); // viol-note {{later used here}}
+}
+
+// With the class lifetime outliving the use, nothing is reported.
+void long_lived_caller() {
+  int y = 0;
+  Holder h(&y);
+  int* r = h.get();
+  use(*r);
+}

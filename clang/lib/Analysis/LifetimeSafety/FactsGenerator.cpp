@@ -1352,6 +1352,40 @@ bool FactsGenerator::handleNamedLifetimeCall(const FunctionDecl *FD,
   // dangle, and the second is an explicit assertion that no lifetime applies.
   // Both therefore leave the result with an empty loan set, which is also what
   // suppresses the `lifetimebound` union for an `$unknown` return.
+  //
+  // A level named with the lifetime of `this` also receives what the object
+  // was built from. The callee may return a value borrowed from any of the
+  // class's lifetimes under the lifetime of `this` (the implied bound in
+  // `Checker.cpp`: an object cannot outlive its own lifetime parameters), so
+  // the caller must treat such a result as borrowing from those lifetimes as
+  // well as from the object. This holds whether the lifetime of `this` was
+  // written or supplied by elision. It is Rust's rule: `&'t Holder<'a>` is
+  // well formed only if `'a: 't`, which the borrow checker enforces at the
+  // call.
+  llvm::StringRef ThisLifetime;
+  LifetimeList ClassLifetimes;
+  if (const auto *MD = dyn_cast<CXXMethodDecl>(FD);
+      MD && MD->isInstance() && !isa<CXXConstructorDecl>(MD) &&
+      !Sig.FunctionType.empty() &&
+      Sig.FunctionType.front().getKind() == LifetimeVar::Kind::Named) {
+    ThisLifetime = Sig.FunctionType.front().getName();
+    ClassLifetimes = getEnclosingClassLifetimeParams(AC.getASTContext(), FD);
+  }
+  auto SourcesFor = [&](llvm::StringRef Name) {
+    auto Own = ByLifetime.lookup(Name);
+    llvm::SmallVector<OriginID, 4> Sources(Own.begin(), Own.end());
+    if (Name != ThisLifetime)
+      return Sources;
+    for (const LifetimeVar &Class : ClassLifetimes) {
+      if (Class.getKind() != LifetimeVar::Kind::Named ||
+          Class.getName() == Name)
+        continue;
+      for (OriginID Src : ByLifetime.lookup(Class.getName()))
+        if (!llvm::is_contained(Sources, Src))
+          Sources.push_back(Src);
+    }
+    return Sources;
+  };
   OriginList *ResultLevel = CallList;
   for (const LifetimeVar &LV : Sig.Return) {
     if (!ResultLevel)
@@ -1360,7 +1394,7 @@ bool FactsGenerator::handleNamedLifetimeCall(const FunctionDecl *FD,
       // A lifetime that appears on the return but on no argument borrows from
       // nothing, so the result is left with an empty loan set.
       bool KillSrc = true;
-      for (OriginID Src : ByLifetime.lookup(LV.getName())) {
+      for (OriginID Src : SourcesFor(LV.getName())) {
         CurrentBlockFacts.push_back(FactMgr.createFact<OriginFlowFact>(
             ResultLevel->getOuterOriginID(), Src, KillSrc));
         KillSrc = false;

@@ -805,9 +805,13 @@ static bool hasAnyLifetimeBound(const FunctionDecl *FD) {
 /// Fills the elided return slots of \p MD from the implicit object parameter.
 ///
 /// This is Crubit's elision rule for methods: an output lifetime that is not
-/// written takes the lifetime of `this`. It is sound, because `this` can never
-/// outlive the object's own lifetime parameters, so tying the result to `this`
-/// never admits more than the class allows. It is conservative for view types,
+/// written takes the lifetime of `this`. The callee may then return a value
+/// borrowed from one of the class's lifetimes, because `this` can never outlive
+/// the object's own lifetime parameters (the implied bound in `Checker.cpp`).
+/// That is sound only because the caller applies the same bound: a result
+/// named with the lifetime of `this` borrows from the object and from the
+/// class lifetimes of the object argument (`handleNamedLifetimeCall`). It is
+/// conservative for view types,
 /// where an accessor really returns something that lives as long as one of the
 /// class's parameters; such accessors are expected to say so, and
 /// `-Wlifetime-safety-named-lifetime-suggestions` points them out.
