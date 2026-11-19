@@ -784,16 +784,17 @@ void test_lifetimebound_multi_level() {
   use(**result);      // expected-note {{used here}}
 }
 
-// FIXME: Assignment does not track the dereference of a pointer.
+// Assignment through a dereferenced pointer updates the pointee's origins as
+// seen through that pointer.
 void test_assign_through_double_ptr() {
   int a = 1, b = 2;
   int* p = &a;
   int** pp = &p;
   {
     int c = 3;
-    *pp = &c;
-  }
-  use(**pp);
+    *pp = &c; // expected-warning {{local variable 'c' does not live long enough}}
+  }           // expected-note {{local variable 'c' is destroyed here}}
+  use(**pp);  // expected-note {{later used here}}
 }
 
 int** test_ternary_double_ptr(bool cond) {

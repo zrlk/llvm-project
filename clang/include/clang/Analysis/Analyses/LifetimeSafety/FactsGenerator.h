@@ -85,6 +85,28 @@ private:
   void handleAssignment(const Expr *TargetExpr, const Expr *LHSExpr,
                         const Expr *RHSExpr);
 
+  /// Whether \p ME names a field declared directly in the record type of its
+  /// base expression (looking through derived-to-base conversions).
+  bool isFieldOfBaseRecord(const MemberExpr *ME);
+
+  /// Connects the origins of a field value with the lifetime-parameter origins
+  /// of the object that holds it. For every level of \p FD's type annotated
+  /// with a named lifetime, flows the matching parameter slot of \p BaseParams
+  /// into the field level (a read, \p IntoField) or the field level into the
+  /// slot without killing it (a store).
+  void flowFieldParamSlots(const FieldDecl *FD, OriginList *FieldValue,
+                           OriginList *BaseParams, bool IntoField);
+
+  /// Returns the origins of the value stored in the object denoted by the
+  /// glvalue \p E, when that object persists across statements (a variable,
+  /// or an object reached from one through dereferences); null otherwise.
+  OriginList *getPersistentValueOrigins(const Expr *E);
+
+  /// Records a store into a field of a record with lifetime parameters
+  /// through a base object other than `this`, so later reads of the object's
+  /// other fields and the object itself see the stored loans.
+  void writeBackFieldStore(const MemberExpr *ME, OriginList *RHSList);
+
   void handlePointerArithmetic(const BinaryOperator *BO);
 
   bool handlePlacementNew(const CXXNewExpr *NE, OriginList *NewList);

@@ -299,6 +299,108 @@ void FactsGenerator::VisitCXXMemberCallExpr(const CXXMemberCallExpr *MCE) {
   handleFunctionCall(MCE, /*IsGslConstruction=*/false);
 }
 
+bool FactsGenerator::isFieldOfBaseRecord(const MemberExpr *ME) {
+  // The base's origins are laid out by the base expression's own record type.
+  // Only substitute when the field is declared directly in that record; a field
+  // inherited from a base class refers to the base class's parameters, whose
+  // origins are not tracked through the derived type. Look through
+  // derived-to-base conversions, which Sema inserts when the field is
+  // inherited: what matters is the record the origins belong to.
+  const Expr *ObjExpr = ME->getBase()->IgnoreParens();
+  while (const auto *CE = dyn_cast<CastExpr>(ObjExpr)) {
+    if (CE->getCastKind() != CK_DerivedToBase &&
+        CE->getCastKind() != CK_UncheckedDerivedToBase &&
+        CE->getCastKind() != CK_NoOp && CE->getCastKind() != CK_LValueToRValue)
+      break;
+    ObjExpr = CE->getSubExpr()->IgnoreParens();
+  }
+  QualType BaseTy = ObjExpr->getType();
+  if (ME->isArrow())
+    BaseTy = BaseTy->getPointeeType();
+  const RecordDecl *BaseRD =
+      BaseTy.isNull() ? nullptr : BaseTy->getAsRecordDecl();
+  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
+  return FD && BaseRD &&
+         BaseRD->getCanonicalDecl() == FD->getParent()->getCanonicalDecl();
+}
+
+void FactsGenerator::flowFieldParamSlots(const FieldDecl *FD,
+                                         OriginList *FieldValue,
+                                         OriginList *BaseParams,
+                                         bool IntoField) {
+  ASTContext &Ctx = AC.getASTContext();
+  LifetimeList FieldLifetimes = getExplicitLifetimes(Ctx, FD->getType());
+  if (FieldLifetimes.empty())
+    return;
+  LifetimeList ClassParams = getDeclaredLifetimeParams(Ctx, FD->getParent());
+  for (const LifetimeVar &LV : FieldLifetimes) {
+    if (!FieldValue)
+      break;
+    if (LV.getKind() == LifetimeVar::Kind::Named) {
+      // Walk the base's parameter origins in declaration order. If the base
+      // has fewer origin levels than the class declares parameters (which
+      // should not happen for a well-formed record), leave the remaining slots
+      // unsubstituted rather than asserting.
+      OriginList *Slot = BaseParams;
+      for (const LifetimeVar &Param : ClassParams) {
+        if (!Slot)
+          break;
+        if (Param.getName() == LV.getName()) {
+          // Reading substitutes the slot into the field (a strong update of
+          // the fresh field origin). Storing adds the field's value to the
+          // slot without killing it: the slot stands for every field that
+          // names the parameter, so the update is weak.
+          OriginID FieldID = FieldValue->getOuterOriginID();
+          OriginID SlotID = Slot->getOuterOriginID();
+          CurrentBlockFacts.push_back(FactMgr.createFact<OriginFlowFact>(
+              IntoField ? FieldID : SlotID, IntoField ? SlotID : FieldID,
+              /*Kill=*/IntoField));
+          break;
+        }
+        Slot = Slot->peelOuterOrigin();
+      }
+    }
+    FieldValue = FieldValue->peelOuterOrigin();
+  }
+}
+
+OriginList *FactsGenerator::getPersistentValueOrigins(const Expr *E) {
+  E = E->IgnoreParens();
+  if (const auto *CE = dyn_cast<CastExpr>(E);
+      CE &&
+      (CE->getCastKind() == CK_LValueToRValue || CE->getCastKind() == CK_NoOp))
+    return getPersistentValueOrigins(CE->getSubExpr());
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    const ValueDecl *VD = DRE->getDecl();
+    if (!isa<VarDecl>(VD))
+      return nullptr;
+    OriginList *List = getOriginsList(*VD);
+    if (List && VD->getType()->isReferenceType())
+      List = List->peelOuterOrigin();
+    return List;
+  }
+  if (const auto *UO = dyn_cast<UnaryOperator>(E);
+      UO && UO->getOpcode() == UO_Deref) {
+    OriginList *Pointer = getPersistentValueOrigins(UO->getSubExpr());
+    return Pointer ? Pointer->peelOuterOrigin() : nullptr;
+  }
+  return nullptr;
+}
+
+void FactsGenerator::writeBackFieldStore(const MemberExpr *ME,
+                                         OriginList *RHSList) {
+  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
+  const Expr *Base = ME->getBase();
+  if (!FD || !RHSList || isa<CXXThisExpr>(Base->IgnoreParenImpCasts()) ||
+      !isFieldOfBaseRecord(ME))
+    return;
+  OriginList *Object = getPersistentValueOrigins(Base);
+  if (Object && ME->isArrow())
+    Object = Object->peelOuterOrigin();
+  if (Object)
+    flowFieldParamSlots(FD, RHSList, Object, /*IntoField=*/false);
+}
+
 void FactsGenerator::VisitMemberExpr(const MemberExpr *ME) {
   auto *MD = ME->getMemberDecl();
   if (const auto *VD = dyn_cast<VarDecl>(MD); VD && doesDeclHaveStorage(VD)) {
@@ -333,62 +435,13 @@ void FactsGenerator::VisitMemberExpr(const MemberExpr *ME) {
   // `this`, whose fields share origins with the FieldDecl and receive their
   // named placeholder loans at function entry), substitute the base object's
   // lifetime-parameter origins into the field's corresponding annotated slots.
-  if (!isa<CXXThisExpr>(Base->IgnoreParenImpCasts()) && Dst && Src) {
-    ASTContext &Ctx = AC.getASTContext();
-    LifetimeList FieldLifetimes = getExplicitLifetimes(Ctx, FD->getType());
-    // The base's origins are laid out by the base expression's own record
-    // type. Only substitute when the field is declared directly in that record;
-    // a field inherited from a base class refers to the base class's
-    // parameters, whose origins are not tracked through the derived type.
-    // Look through derived-to-base conversions, which Sema inserts when the
-    // field is inherited: what matters is the record the origins belong to.
-    const Expr *ObjExpr = Base->IgnoreParens();
-    while (const auto *CE = dyn_cast<CastExpr>(ObjExpr)) {
-      if (CE->getCastKind() != CK_DerivedToBase &&
-          CE->getCastKind() != CK_UncheckedDerivedToBase &&
-          CE->getCastKind() != CK_NoOp &&
-          CE->getCastKind() != CK_LValueToRValue)
-        break;
-      ObjExpr = CE->getSubExpr()->IgnoreParens();
-    }
-    QualType BaseTy = ObjExpr->getType();
-    if (ME->isArrow())
-      BaseTy = BaseTy->getPointeeType();
-    const RecordDecl *BaseRD =
-        BaseTy.isNull() ? nullptr : BaseTy->getAsRecordDecl();
-    const RecordDecl *RD = FD->getParent();
-    bool FieldOfBaseRecord =
-        BaseRD && BaseRD->getCanonicalDecl() == RD->getCanonicalDecl();
-    if (!FieldLifetimes.empty() && FieldOfBaseRecord) {
-      LifetimeList ClassParams = getDeclaredLifetimeParams(Ctx, RD);
-      OriginList *BaseParams =
-          ME->isArrow() || Base->isGLValue() ? Src->peelOuterOrigin() : Src;
-      OriginList *FieldValue =
-          doesDeclHaveStorage(FD) ? Dst->peelOuterOrigin() : Dst;
-      for (const LifetimeVar &LV : FieldLifetimes) {
-        if (!FieldValue)
-          break;
-        if (LV.getKind() == LifetimeVar::Kind::Named) {
-          // Walk the base's parameter origins in declaration order. If the
-          // base has fewer origin levels than the class declares parameters
-          // (which should not happen for a well-formed record), leave the
-          // remaining slots unsubstituted rather than asserting.
-          OriginList *Slot = BaseParams;
-          for (const LifetimeVar &Param : ClassParams) {
-            if (!Slot)
-              break;
-            if (Param.getName() == LV.getName()) {
-              CurrentBlockFacts.push_back(FactMgr.createFact<OriginFlowFact>(
-                  FieldValue->getOuterOriginID(), Slot->getOuterOriginID(),
-                  /*Kill=*/true));
-              break;
-            }
-            Slot = Slot->peelOuterOrigin();
-          }
-        }
-        FieldValue = FieldValue->peelOuterOrigin();
-      }
-    }
+  if (!isa<CXXThisExpr>(Base->IgnoreParenImpCasts()) && Dst && Src &&
+      isFieldOfBaseRecord(ME)) {
+    OriginList *BaseParams =
+        ME->isArrow() || Base->isGLValue() ? Src->peelOuterOrigin() : Src;
+    OriginList *FieldValue =
+        doesDeclHaveStorage(FD) ? Dst->peelOuterOrigin() : Dst;
+    flowFieldParamSlots(FD, FieldValue, BaseParams, /*IntoField=*/true);
   }
 }
 
@@ -547,6 +600,9 @@ void FactsGenerator::handleAssignment(const Expr *TargetExpr,
   OriginList *RHSList = readValue(RHSExpr);
   OriginList *LHSList = nullptr;
 
+  // The origins of the object written through `*p`, which outlives the
+  // expression: the store must land there for later reads of `*p` to see it.
+  OriginList *PersistentTarget = nullptr;
   if (const auto *DRE_LHS = dyn_cast<DeclRefExpr>(LHSExpr)) {
     LHSList = getOriginsList(*DRE_LHS);
     assert(LHSList && "LHS is a DRE and should have an origin list");
@@ -557,6 +613,12 @@ void FactsGenerator::handleAssignment(const Expr *TargetExpr,
   if (const auto *ME_LHS = dyn_cast<MemberExpr>(LHSExpr)) {
     LHSList = getOriginsList(*ME_LHS);
     assert(LHSList && "LHS is a MemberExpr and should have an origin list");
+    writeBackFieldStore(ME_LHS, RHSList);
+  }
+  if (const auto *UO_LHS = dyn_cast<UnaryOperator>(LHSExpr);
+      UO_LHS && UO_LHS->getOpcode() == UO_Deref) {
+    LHSList = getOriginsList(*UO_LHS);
+    PersistentTarget = getPersistentValueOrigins(UO_LHS);
   }
   if (!LHSList)
     return;
@@ -568,11 +630,17 @@ void FactsGenerator::handleAssignment(const Expr *TargetExpr,
          LHSInner = LHSInner->peelOuterOrigin())
       CurrentBlockFacts.push_back(
           FactMgr.createFact<KillOriginFact>(LHSInner->getOuterOriginID()));
+    for (OriginList *Target = PersistentTarget; Target;
+         Target = Target->peelOuterOrigin())
+      CurrentBlockFacts.push_back(
+          FactMgr.createFact<KillOriginFact>(Target->getOuterOriginID()));
     return;
   }
   // Kill the old loans of the destination origin and flow the new loans
   // from the source origin.
   flow(LHSList->peelOuterOrigin(), RHSList, /*Kill=*/true);
+  if (PersistentTarget)
+    flow(PersistentTarget, RHSList, /*Kill=*/true);
 
   // In C, assignment expressions are not GLValues, so the assignment result has
   // the assigned value origins, not the LHS storage origin.
@@ -698,10 +766,16 @@ void FactsGenerator::VisitCXXOperatorCallExpr(const CXXOperatorCallExpr *OCE) {
       return;
     }
     // Other tracked types: only defaulted operator= propagates origins.
-    // User-defined operator= has opaque semantics, so don't handle them now.
+    // User-defined operator= has opaque semantics, so don't handle them now,
+    // except for copy and move assignment of a record that declares lifetime
+    // parameters: its type says the parameters are those of the source.
     if (const auto *MD =
             dyn_cast_or_null<CXXMethodDecl>(OCE->getDirectCallee());
-        MD && MD->isDefaulted()) {
+        MD &&
+        (MD->isDefaulted() ||
+         ((MD->isCopyAssignmentOperator() || MD->isMoveAssignmentOperator()) &&
+          !getDeclaredLifetimeParams(AC.getASTContext(), MD->getParent())
+               .empty()))) {
       handleAssignment(OCE, OCE->getArg(0), OCE->getArg(1));
       return;
     }

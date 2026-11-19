@@ -118,16 +118,16 @@ void declared_only_caller() {
   use(*r); // viol-note {{later used here}}
 }
 
-// FIXME: assigning through a pointer does not reach the pointee's origins, so
-// this is missed even with `int* $a` on the result, and for a plain `hp->p`.
+// Assigning through a pointer reaches the pointee's origins.
 void through_pointer_caller(Holder* hp) {
   int* r;
   {
     int x = 1;
-    *hp = Holder(&x);
-    r = hp->decl();
-  }
-  use(*r);
+    *hp = Holder(&x); // viol-warning {{local variable 'x' does not live long enough}}
+    r = hp->decl();   // viol-note {{parameter 'hp' aliases the storage of local variable 'x'}} \
+                      // viol-note {{result of call to 'decl' aliases the storage of local variable 'x'}}
+  } // viol-note {{destroyed here}}
+  use(*r); // viol-note {{later used here}}
 }
 
 // Borrowing from both, so the named-return suggestion is withheld.
