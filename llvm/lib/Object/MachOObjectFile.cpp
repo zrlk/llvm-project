@@ -2919,7 +2919,7 @@ Triple MachOObjectFile::getArchTriple(uint32_t CPUType, uint32_t CPUSubType,
       return Triple("arm64e-apple-darwin");
     case MachO::CPU_SUBTYPE_ARM64E_X1:
       if (McpuDefault)
-        *McpuDefault = "apple-a20";
+        *McpuDefault = "apple-m6";
       if (ArchFlag)
         *ArchFlag = "arm64e.x1";
       return Triple("arm64e.x1-apple-darwin");
@@ -2979,12 +2979,12 @@ bool MachOObjectFile::isValidArch(StringRef ArchFlag) {
 }
 
 ArrayRef<StringRef> MachOObjectFile::getValidArchs() {
-  static const std::array<StringRef, 21> ValidArchs = {{
+  static const std::array<StringRef, 22> ValidArchs = {{
       "i386",          "x86_64", "x86_64h", "armv4t",      "arm",
       "armv5e",        "armv6",  "armv6m",  "armv7",       "armv7em",
       "armv7k",        "armv7m", "armv7s",  "armv8m.base", "armv8m.main",
-      "armv8.1m.main", "arm64",  "arm64e",  "arm64_32",    "ppc",
-      "ppc64",
+      "armv8.1m.main", "arm64",  "arm64e",  "arm64e.x1",   "arm64_32",
+      "ppc",           "ppc64",
   }};
 
   return ValidArchs;
