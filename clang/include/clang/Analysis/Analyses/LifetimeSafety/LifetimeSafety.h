@@ -318,6 +318,24 @@ public:
   virtual void reportStaticFieldViolation(SourceLocation Loc,
                                           const FieldDecl *Field) {}
 
+  /// Reports a value borrowed from lifetime \p Found that the function may
+  /// leave, when it returns, at level \p Level below the pointer or reference
+  /// parameter \p PVD (1 for what \p PVD refers to), where the parameter's
+  /// type declares \p Required, or no lifetime if \p Required is empty. \p Loc
+  /// is the stored value.
+  virtual void reportParamLifetimeViolation(SourceLocation Loc,
+                                            const ParmVarDecl *PVD,
+                                            unsigned Level,
+                                            llvm::StringRef Found,
+                                            llvm::StringRef Required) {}
+
+  /// Reports a value borrowed from the caller's storage that the function may
+  /// leave, when it returns, at level \p Level below the parameter \p PVD,
+  /// where the parameter's type declares `$static`.
+  virtual void reportStaticParamViolation(SourceLocation Loc,
+                                          const ParmVarDecl *PVD,
+                                          unsigned Level) {}
+
   /// Reports a parameter marked `lifetimebound` -- asserting the result may
   /// borrow from it -- whose named lifetime differs from the one the return
   /// type declares. \p ReturnLoc points at the return type's annotation.

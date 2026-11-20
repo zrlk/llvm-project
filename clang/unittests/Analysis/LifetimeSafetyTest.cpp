@@ -1787,16 +1787,31 @@ TEST_F(LifetimeAnalysisTest, DereferenceAccessesOneLevel) {
   EXPECT_THAT(NoOrigins(), AreLiveAt("p2"));
 }
 
+// `q` is a local, so the store through it is not visible to the caller (see
+// WriteThroughPointerParamEscapes for a store through a parameter).
 TEST_F(LifetimeAnalysisTest, WriteThroughDereferenceIsAUse) {
   SetupTest(R"(
     void target(MyObj** pp) {
+      MyObj** q = pp;
       POINT(p1);
-      *pp = nullptr;
+      *q = nullptr;
       POINT(p2);
     }
   )");
-  EXPECT_THAT(Origins({"pp"}), MustBeLiveAt("p1"));
+  EXPECT_THAT(Origins({"q"}), MustBeLiveAt("p1"));
   EXPECT_THAT(NoOrigins(), AreLiveAt("p2"));
+}
+
+// A value stored through a pointer parameter is visible to the caller, so it
+// stays live until the function returns.
+TEST_F(LifetimeAnalysisTest, WriteThroughPointerParamEscapes) {
+  SetupTest(R"(
+    void target(MyObj** pp, MyObj* v) {
+      POINT(p1);
+      *pp = v;
+    }
+  )");
+  EXPECT_THAT(Origins({"pp", "v"}), MustBeLiveAt("p1"));
 }
 
 // Assigning to a variable is an access to that variable's own storage, which is

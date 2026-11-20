@@ -237,6 +237,16 @@ OriginList *OriginManager::createSingleOriginList(OriginID OID) {
   return new (ListAllocator.Allocate<OriginList>()) OriginList(OID);
 }
 
+OriginList *OriginManager::createParamSinkList(const ParmVarDecl *PVD) {
+  QualType Ty = PVD->getType();
+  if (!Ty->isPointerOrReferenceType())
+    return nullptr;
+  QualType Referent = Ty->getPointeeType();
+  if (!hasOrigins(Referent))
+    return nullptr;
+  return buildListForType(Referent, static_cast<const Expr *>(nullptr));
+}
+
 template <typename T>
 OriginList *OriginManager::buildListForType(QualType QT, const T *Node,
                                             bool NamesDeclStorage) {

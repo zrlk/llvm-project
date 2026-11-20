@@ -11280,6 +11280,23 @@ def warn_lifetime_safety_static_field_violation
 
 def note_lifetime_safety_field_declared_here : Note<"field %0 declared here">;
 
+def warn_lifetime_safety_param_lifetime_violation
+    : Warning<"storing a value borrowed from lifetime '%0' %select{into what "
+              "parameter %2 refers to|at level %3 below parameter %2}1, whose "
+              "type declares %select{no lifetime|lifetime '%5'}4 there">,
+      InGroup<LifetimeSafetyNamedLifetimeViolation>,
+      DefaultIgnore;
+
+def warn_lifetime_safety_static_param_violation
+    : Warning<"storing a value borrowed from this function's caller "
+              "%select{into what parameter %1 refers to|at level %2 below "
+              "parameter %1}0, whose type declares lifetime 'static' there">,
+      InGroup<LifetimeSafetyNamedLifetimeViolation>,
+      DefaultIgnore;
+
+def note_lifetime_safety_param_declared_here
+    : Note<"parameter %0 declared here">;
+
 def warn_lifetime_safety_reserved_lifetime_param
     : Warning<"'%0' is a distinguished lifetime and cannot be introduced as a "
               "parameter">,

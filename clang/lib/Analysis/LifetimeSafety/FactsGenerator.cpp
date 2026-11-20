@@ -133,6 +133,7 @@ void FactsGenerator::run() {
   llvm::TimeTraceScope TimeProfile("FactGenerator");
   const CFG &Cfg = *AC.getCFG();
   llvm::SmallVector<Fact *> PlaceholderLoanFacts = issuePlaceholderLoans();
+  bool VisitedExit = false;
   // Iterate through the CFG blocks in reverse post-order to ensure that
   // initializations and destructions are processed in the correct sequence.
   for (const CFGBlock *Block : *AC.getAnalysis<PostOrderCFGView>()) {
@@ -157,13 +158,28 @@ void FactsGenerator::run() {
         handleFullExprCleanup(*FullExprCleanup);
       }
     }
-    if (Block == &Cfg.getExit())
+    if (Block == &Cfg.getExit()) {
       handleExitBlock();
+      VisitedExit = true;
+    }
 
     CurrentBlockFacts.append(EscapesInCurrentBlock.begin(),
                              EscapesInCurrentBlock.end());
     FactMgr.addBlockFacts(Block, CurrentBlockFacts);
   }
+  // What the function stored through its pointer and reference parameters is
+  // seen by the caller, so it escapes at the exit. The stores are all known
+  // only now: in reverse post-order a loop body can come after the exit.
+  if (const auto *FD = dyn_cast<FunctionDecl>(AC.getDecl()); FD && VisitedExit)
+    for (const ParmVarDecl *PVD : FD->parameters()) {
+      unsigned Level = 1;
+      for (OriginList *L = ParamSinks.lookup(PVD); L;
+           L = L->peelOuterOrigin(), ++Level)
+        FactMgr.appendBlockFact(
+            &Cfg.getExit(),
+            FactMgr.createFact<ParamEscapeFact>(L->getOuterOriginID(), PVD,
+                                                Level, FD->getEndLoc()));
+    }
   FactMgr.computePersistentOrigins(Cfg);
 }
 
@@ -399,6 +415,45 @@ void FactsGenerator::writeBackFieldStore(const MemberExpr *ME,
     Object = Object->peelOuterOrigin();
   if (Object)
     flowFieldParamSlots(FD, RHSList, Object, /*IntoField=*/false);
+  // A store into a field of what a parameter refers to is seen by the caller.
+  if (const ParmVarDecl *PVD =
+          getParamStoredThrough(Base, /*IsPointerValue=*/ME->isArrow()))
+    if (OriginList *Sink = getParamSink(PVD))
+      flowFieldParamSlots(FD, RHSList, Sink, /*IntoField=*/false);
+}
+
+const ParmVarDecl *FactsGenerator::getParamStoredThrough(const Expr *E,
+                                                         bool IsPointerValue) {
+  E = E->IgnoreParens();
+  if (IsPointerValue) {
+    // The pointer must be the parameter's own value, as read from it.
+    while (const auto *CE = dyn_cast<ImplicitCastExpr>(E)) {
+      if (CE->getCastKind() != CK_LValueToRValue &&
+          CE->getCastKind() != CK_NoOp)
+        return nullptr;
+      E = CE->getSubExpr()->IgnoreParens();
+    }
+  } else if (const auto *UO = dyn_cast<UnaryOperator>(E);
+             UO && UO->getOpcode() == UO_Deref) {
+    return getParamStoredThrough(UO->getSubExpr(), /*IsPointerValue=*/true);
+  }
+  const auto *DRE = dyn_cast<DeclRefExpr>(E);
+  const auto *PVD = DRE ? dyn_cast<ParmVarDecl>(DRE->getDecl()) : nullptr;
+  // A parameter of an enclosing function, captured by a lambda, belongs to
+  // that function's contract, not to the lambda's.
+  if (!PVD || PVD->getDeclContext() != dyn_cast<DeclContext>(AC.getDecl()))
+    return nullptr;
+  QualType Ty = PVD->getType();
+  return (IsPointerValue ? Ty->isPointerType() : Ty->isReferenceType())
+             ? PVD
+             : nullptr;
+}
+
+OriginList *FactsGenerator::getParamSink(const ParmVarDecl *PVD) {
+  auto [It, Inserted] = ParamSinks.try_emplace(PVD, nullptr);
+  if (Inserted)
+    It->second = FactMgr.getOriginMgr().createParamSinkList(PVD);
+  return It->second;
 }
 
 void FactsGenerator::VisitMemberExpr(const MemberExpr *ME) {
@@ -622,6 +677,13 @@ void FactsGenerator::handleAssignment(const Expr *TargetExpr,
   }
   if (!LHSList)
     return;
+  // A store into what a parameter refers to (`*p = v` for a pointer parameter,
+  // `r = v` for a reference parameter) is seen by the caller: it also goes to
+  // the parameter's sink, checked at the exit.
+  OriginList *ParamSink = nullptr;
+  if (const ParmVarDecl *PVD =
+          getParamStoredThrough(LHSExpr, /*IsPointerValue=*/false))
+    ParamSink = getParamSink(PVD);
 
   if (!RHSList) {
     // RHS has no tracked origins (e.g., assigning a callable without origins
@@ -630,10 +692,10 @@ void FactsGenerator::handleAssignment(const Expr *TargetExpr,
          LHSInner = LHSInner->peelOuterOrigin())
       CurrentBlockFacts.push_back(
           FactMgr.createFact<KillOriginFact>(LHSInner->getOuterOriginID()));
-    for (OriginList *Target = PersistentTarget; Target;
-         Target = Target->peelOuterOrigin())
-      CurrentBlockFacts.push_back(
-          FactMgr.createFact<KillOriginFact>(Target->getOuterOriginID()));
+    for (OriginList *Target : {PersistentTarget, ParamSink})
+      for (; Target; Target = Target->peelOuterOrigin())
+        CurrentBlockFacts.push_back(
+            FactMgr.createFact<KillOriginFact>(Target->getOuterOriginID()));
     return;
   }
   // Kill the old loans of the destination origin and flow the new loans
@@ -641,6 +703,8 @@ void FactsGenerator::handleAssignment(const Expr *TargetExpr,
   flow(LHSList->peelOuterOrigin(), RHSList, /*Kill=*/true);
   if (PersistentTarget)
     flow(PersistentTarget, RHSList, /*Kill=*/true);
+  if (ParamSink)
+    flow(ParamSink, RHSList, /*Kill=*/true);
 
   // In C, assignment expressions are not GLValues, so the assignment result has
   // the assigned value origins, not the LHS storage origin.

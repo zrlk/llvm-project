@@ -158,6 +158,15 @@ public:
   /// can refer to a single level of an existing OriginList.
   OriginList *createSingleOriginList(OriginID OID);
 
+  /// Creates a list of fresh origins mirroring the levels of what the pointer
+  /// or reference parameter \p PVD refers to (one level for `int** p`, also
+  /// one for `int*& r`), for the loans a function stores there. The origins
+  /// belong to no declaration or expression, so nothing but the stores that
+  /// are routed to them reaches them.
+  ///
+  /// \returns The OriginList, or nullptr if the referent has no origins.
+  OriginList *createParamSinkList(const ParmVarDecl *PVD);
+
   /// Returns the OriginList for the implicit 'this' parameter if the current
   /// declaration is an instance method.
   std::optional<OriginList *> getThisOrigins() const { return ThisOrigins; }

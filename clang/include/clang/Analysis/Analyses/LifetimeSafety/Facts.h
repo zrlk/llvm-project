@@ -253,6 +253,7 @@ public:
     Global, /// Escapes via assignment to global storage.
     This,   /// Escapes via the enclosing object `this`, which outlives the
             /// method.
+    Param,  /// Escapes via what a parameter refers to, which the caller sees.
   } EscKind;
 
   static bool classof(const Fact *F) {
@@ -372,6 +373,40 @@ public:
            static_cast<const OriginEscapesFact *>(F)->getEscapeKind() ==
                EscapeKind::This;
   }
+  SourceLocation getLoc() const { return Loc; }
+  void dump(llvm::raw_ostream &OS, const LoanManager &, const OriginManager &OM,
+            const LoanPropagationAnalysis *LPA = nullptr) const override;
+};
+
+/// Represents the loans a function stored into what a pointer or reference
+/// parameter refers to, which the caller sees after the call. Emitted at
+/// function exit for each level of the referent that a store reached, so the
+/// stored values are checked against the lifetimes the parameter's type
+/// declares there, and a stored borrow of a local is seen as escaping. The
+/// origin is the parameter's sink at that level: it starts empty and receives
+/// only the stores, so the loans of the caller's own value are not checked.
+class ParamEscapeFact : public OriginEscapesFact {
+  const ParmVarDecl *Param;
+  unsigned Level;
+  SourceLocation Loc;
+
+public:
+  ParamEscapeFact(OriginID OID, const ParmVarDecl *Param, unsigned Level,
+                  SourceLocation Loc)
+      : OriginEscapesFact(OID, EscapeKind::Param), Param(Param), Level(Level),
+        Loc(Loc) {}
+
+  static bool classof(const Fact *F) {
+    return F->getKind() == Kind::OriginEscapes &&
+           static_cast<const OriginEscapesFact *>(F)->getEscapeKind() ==
+               EscapeKind::Param;
+  }
+  const ParmVarDecl *getParam() const { return Param; }
+  /// The level below the parameter that the stored value occupies: 1 for
+  /// what the parameter points or refers to, 2 for what that points to, and
+  /// so on. It indexes the parameter's lifetimes, outermost first.
+  unsigned getLevel() const { return Level; }
+  /// Where the function returns to its caller.
   SourceLocation getLoc() const { return Loc; }
   void dump(llvm::raw_ostream &OS, const LoanManager &, const OriginManager &OM,
             const LoanPropagationAnalysis *LPA = nullptr) const override;

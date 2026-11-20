@@ -107,6 +107,18 @@ private:
   /// other fields and the object itself see the stored loans.
   void writeBackFieldStore(const MemberExpr *ME, OriginList *RHSList);
 
+  /// Returns the parameter of the analyzed function whose referent \p E
+  /// denotes: `*p` for a pointer parameter `p`, or `r` for a reference
+  /// parameter `r`. If \p IsPointerValue, \p E is instead the pointer itself,
+  /// as the base of `p->f`. Returns null for anything else.
+  const ParmVarDecl *getParamStoredThrough(const Expr *E, bool IsPointerValue);
+
+  /// Returns the origins that collect the loans the function stores into what
+  /// \p PVD refers to, creating them on first use (see
+  /// OriginManager::createParamSinkList); null if the referent has no
+  /// origins.
+  OriginList *getParamSink(const ParmVarDecl *PVD);
+
   void handlePointerArithmetic(const BinaryOperator *BO);
 
   bool handlePlacementNew(const CXXNewExpr *NE, OriginList *NewList);
@@ -227,6 +239,9 @@ private:
   llvm::DenseMap<const ValueDecl *,
                  llvm::SmallVector<const MaterializeTemporaryExpr *, 1>>
       ExtendedTemporaries;
+  /// The sinks of the parameters the function stores through, checked against
+  /// the parameters' declared lifetimes at the exit (ParamEscapeFact).
+  llvm::DenseMap<const ParmVarDecl *, OriginList *> ParamSinks;
   const CFGBlock *CurrentBlock;
   bool IsCMode = false;
 };

@@ -655,6 +655,30 @@ public:
         << Field;
   }
 
+  void reportParamLifetimeViolation(SourceLocation Loc, const ParmVarDecl *PVD,
+                                    unsigned Level, llvm::StringRef Found,
+                                    llvm::StringRef Required) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_param_lifetime_violation)
+        << Found << (Level == 1 ? 0 : 1) << PVD << Level
+        << (Required.empty() ? 0 : 1) << Required;
+    // Only the value stored directly into what the parameter refers to may
+    // outlive the declared lifetime: below a pointer that can be written, the
+    // lifetimes must be equal, so no single outlives bound would do.
+    if (Level == 1 && !Required.empty())
+      S.Diag(Loc, diag::note_lifetime_safety_outlives_bound_would_help)
+          << Found << Required;
+    S.Diag(PVD->getLocation(), diag::note_lifetime_safety_param_declared_here)
+        << PVD;
+  }
+
+  void reportStaticParamViolation(SourceLocation Loc, const ParmVarDecl *PVD,
+                                  unsigned Level) override {
+    S.Diag(Loc, diag::warn_lifetime_safety_static_param_violation)
+        << (Level == 1 ? 0 : 1) << PVD << Level;
+    S.Diag(PVD->getLocation(), diag::note_lifetime_safety_param_declared_here)
+        << PVD;
+  }
+
   /// Points at the return type's annotation, which is what establishes the
   /// contract the parameter is being compared against. It may be absent when
   /// the lifetime was spelled on a redeclaration that has no `TypeSourceInfo`.

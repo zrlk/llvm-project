@@ -1283,10 +1283,11 @@ void test_variadic() {
 }
 } // namespace VariadicTemplatedParamsUAR
 
-// FIXME: Fails to diagnose UAF when a reference to a by-value param escapes via an out-param.
+// A reference to a by-value param escapes via an out-param.
 void uaf_from_by_value_param_failing(MyObj param, View* out_p) {
-  *out_p = Identity(param);
-}
+  *out_p = Identity(param); // expected-warning {{parameter 'param' does not live long enough}} \
+                            // expected-note {{result of call to 'Identity' aliases the storage of parameter 'param' because parameter 'v' is marked as lifetimebound}}
+} // expected-note {{parameter 'param' is destroyed here}} expected-note {{later used here}}
 
 // Conditional operator.
 void conditional_operator_one_unsafe_branch(bool cond) {

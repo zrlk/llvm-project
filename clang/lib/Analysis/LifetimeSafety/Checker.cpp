@@ -99,6 +99,22 @@ private:
   /// Fields declared `$static` that may hold, when the member function
   /// returns, a value borrowed from caller storage.
   llvm::SetVector<const FieldDecl *> StaticFieldViolations;
+  /// A loan left, when the function returns, at a level below a parameter
+  /// whose type declares a lifetime there that the loan does not satisfy.
+  struct ParamViolation {
+    /// The escape at the exit, and the loan, from which the store is traced.
+    const ParamEscapeFact *Escape;
+    LoanID LID;
+    /// The lifetime the loan borrows from, and the one the parameter declares
+    /// at that level (empty if it declares none). Unused for `$static`.
+    llvm::StringRef Found, Required;
+  };
+  /// Keyed by the parameter and the level below it.
+  using ParamLevel = std::pair<const ParmVarDecl *, unsigned>;
+  llvm::MapVector<ParamLevel, ParamViolation> ParamLifetimeViolations;
+  llvm::MapVector<ParamLevel, ParamViolation> StaticParamViolations;
+  /// The lifetimes written on each parameter, outermost level first.
+  llvm::DenseMap<const ParmVarDecl *, LifetimeList> ParamLifetimes;
   /// The lifetimes declared on the return type, ordered outermost-first so
   /// they zip positionally with the returned expression's `OriginList`.
   LifetimeList ReturnLifetimes;
@@ -163,9 +179,11 @@ public:
       LifetimeSignature Sig = getLifetimeSignature(AST, Fn);
       ReturnLifetimes = std::move(Sig.Return);
       for (unsigned I = 0, E = Fn->getNumParams(); I != E; ++I)
-        if (I < Sig.Params.size() && !Sig.Params[I].empty())
+        if (I < Sig.Params.size() && !Sig.Params[I].empty()) {
           ParamLifetimeKinds[Fn->getParamDecl(I)] =
               Sig.Params[I].front().getKind();
+          ParamLifetimes[Fn->getParamDecl(I)] = Sig.Params[I];
+        }
       if (const auto *MD = dyn_cast<CXXMethodDecl>(Fn);
           MD && MD->isInstance() && !Sig.FunctionType.empty()) {
         ParamLifetimeKinds[MD] = Sig.FunctionType.front().getKind();
@@ -265,15 +283,27 @@ public:
           AnnotationWarningsMap.try_emplace(MD, ReturnEsc->getReturnExpr());
       }
     };
-    // A value leaves the function either through the return or by being left
-    // in a field of `*this`. In both cases the type of the place it ends up in
-    // may declare a lifetime, and the value must satisfy it.
+    // A value leaves the function through the return, by being left in a
+    // field of `*this`, or by being stored into what a parameter refers to. In
+    // each case the type of the place it ends up in may declare a lifetime, and
+    // the value must satisfy it.
     const auto *ReturnEsc = dyn_cast<ReturnEscapeFact>(OEF);
     const auto *FieldEsc = dyn_cast<FieldEscapeFact>(OEF);
+    const auto *ParamEsc = dyn_cast<ParamEscapeFact>(OEF);
     std::optional<LifetimeVar> TargetLifetime =
-        ReturnEsc ? getReturnLifetimeForOrigin(ReturnEsc)
-                  : getFieldLifetimeForOrigin(FieldEsc);
-    auto CheckNamedLifetime = [&](const NamedLifetime *NL) {
+        ReturnEsc  ? getReturnLifetimeForOrigin(ReturnEsc)
+        : FieldEsc ? getFieldLifetimeForOrigin(FieldEsc)
+                   : getParamLifetimeForOrigin(ParamEsc);
+    auto CheckNamedLifetime = [&](const NamedLifetime *NL, LoanID LID) {
+      // The caller writes back what a level below a parameter holds only
+      // where the parameter's type names a lifetime: a level with nothing
+      // written accepts no named loan, as no outlives relation is declared.
+      if (ParamEsc && TargetLifetime && TargetLifetime->isElided()) {
+        ParamLifetimeViolations.try_emplace(
+            {ParamEsc->getParam(), ParamEsc->getLevel()},
+            ParamViolation{ParamEsc, LID, NL->getName(), {}});
+        return;
+      }
       if (!TargetLifetime ||
           TargetLifetime->getKind() != LifetimeVar::Kind::Named)
         return;
@@ -293,16 +323,20 @@ public:
       auto Violation = std::make_pair(NL->getName(), TargetLifetime->getName());
       if (ReturnEsc)
         LifetimeViolations.try_emplace(ReturnEsc->getReturnExpr(), Violation);
-      else
+      else if (FieldEsc)
         FieldLifetimeViolations.try_emplace(FieldEsc->getFieldDecl(),
                                             Violation);
+      else
+        ParamLifetimeViolations.try_emplace(
+            {ParamEsc->getParam(), ParamEsc->getLevel()},
+            ParamViolation{ParamEsc, LID, Violation.first, Violation.second});
     };
     // A `$static` position promises storage that never expires, which nothing
     // the caller passes in provides -- unless the caller was itself told to
     // pass storage that never expires. \p Source is the position the loan came
     // from, or null for a loan minted from a named lifetime, which is
     // caller-scoped by construction.
-    auto CheckStatic = [&](const Decl *Source) {
+    auto CheckStatic = [&](const Decl *Source, LoanID LID) {
       if (!TargetLifetime ||
           TargetLifetime->getKind() != LifetimeVar::Kind::Static)
         return;
@@ -310,8 +344,12 @@ public:
         return;
       if (ReturnEsc)
         StaticReturnViolations.insert(ReturnEsc->getReturnExpr());
-      else
+      else if (FieldEsc)
         StaticFieldViolations.insert(FieldEsc->getFieldDecl());
+      else
+        StaticParamViolations.try_emplace(
+            {ParamEsc->getParam(), ParamEsc->getLevel()},
+            ParamViolation{ParamEsc, LID, {}, {}});
     };
     if (ReturnEsc && ReturnElidedToThis)
       noteElidedReturn(ReturnEsc, EscapedLoans);
@@ -347,15 +385,15 @@ public:
         continue;
       if (const auto *PVD = PB->getParmVarDecl()) {
         CheckParam(PVD, /*IsMoved=*/MovedAtEscape.lookup(LID));
-        CheckStatic(PVD);
+        CheckStatic(PVD, LID);
       } else if (const auto *MD = PB->getImplicitThisParent()) {
         CheckImplicitThis(MD);
-        CheckStatic(MD);
+        CheckStatic(MD, LID);
       } else if (const auto *Field = PB->getFieldDecl()) {
         CheckField(Field);
       } else if (const auto *NL = PB->getNamedLifetime()) {
-        CheckNamedLifetime(NL);
-        CheckStatic(/*Source=*/nullptr);
+        CheckNamedLifetime(NL, LID);
+        CheckStatic(/*Source=*/nullptr, LID);
       }
     }
   }
@@ -449,6 +487,29 @@ public:
     return std::nullopt;
   }
 
+  /// Finds the lifetime written on the parameter escaping in \p ParamEsc at
+  /// the level of the escaping origin. A level with nothing written on it is
+  /// elided.
+  std::optional<LifetimeVar>
+  getParamLifetimeForOrigin(const ParamEscapeFact *ParamEsc) const {
+    if (!ParamEsc)
+      return std::nullopt;
+    auto It = ParamLifetimes.find(ParamEsc->getParam());
+    if (It == ParamLifetimes.end() || ParamEsc->getLevel() >= It->second.size())
+      return LifetimeVar::elided();
+    return It->second[ParamEsc->getLevel()];
+  }
+
+  /// The best place to blame for a loan left below a parameter: the value
+  /// whose store put it there, found by tracing the loan back from the exit,
+  /// or else the parameter.
+  SourceLocation getParamBlameLoc(const ParamViolation &V) {
+    llvm::SmallVector<const Expr *> Chain = getExprChain(
+        LoanPropagation.buildOriginFlowChain(V.Escape, V.LID, Cfg));
+    return Chain.empty() ? V.Escape->getParam()->getLocation()
+                         : Chain.front()->getExprLoc();
+  }
+
   /// The best place to blame for what \p Field holds when the member function
   /// returns: the field's initializer, if this is a constructor that writes
   /// one, and otherwise the function itself, since the analysis does not
@@ -528,6 +589,12 @@ public:
           getFieldBlameLoc(Field), Field, Violation.first, Violation.second);
     for (const FieldDecl *Field : StaticFieldViolations)
       SemaHelper->reportStaticFieldViolation(getFieldBlameLoc(Field), Field);
+    for (const auto &[Key, V] : ParamLifetimeViolations)
+      SemaHelper->reportParamLifetimeViolation(getParamBlameLoc(V), Key.first,
+                                               Key.second, V.Found, V.Required);
+    for (const auto &[Key, V] : StaticParamViolations)
+      SemaHelper->reportStaticParamViolation(getParamBlameLoc(V), Key.first,
+                                             Key.second);
   }
 
   /// An entity that a parameter is captured by.
@@ -597,29 +664,42 @@ public:
   void checkExpiry(const ExpireFact *EF) {
     const AccessPath &ExpiredPath = EF->getAccessPath();
     LiveOriginSet Origins = LiveOrigins.getLiveOriginsAt(EF);
-    for (const LivenessMap &Live : {Origins.Persistent, Origins.BlockLocal})
-      for (auto &[OID, LiveInfo] : Live) {
-        LoanSet HeldLoans = LoanPropagation.getLoans(OID, EF);
-        for (LoanID HeldLoanID : HeldLoans) {
-          const Loan *HeldLoan = FactMgr.getLoanMgr().getLoan(HeldLoanID);
-          if (!ExpiredPath.isPrefixOf(HeldLoan->getAccessPath()))
+    // Origins live for a use go first: a loan that is also stored through a
+    // parameter is reported at the use, which says more than the exit does.
+    for (bool ParamEscapes : {false, true})
+      for (const LivenessMap &Live : {Origins.Persistent, Origins.BlockLocal})
+        for (auto &[OID, LiveInfo] : Live) {
+          if (isParamEscapeCause(LiveInfo.CausingFact) != ParamEscapes)
             continue;
-          // HeldLoan is expired because its base or itself is expired.
-          PendingWarning &CurWarning = FinalWarningsMap[HeldLoan->getID()];
-          const Expr *MovedExpr = nullptr;
-          if (auto *ME = MovedLoans.getMovedLoans(EF).lookup(HeldLoanID))
-            MovedExpr = *ME;
-          // Skip if we already have a dominating causing fact.
-          if (CurWarning.CausingFactDominatesExpiry)
-            continue;
-          if (causingFactDominatesExpiry(LiveInfo.Kind))
-            CurWarning.CausingFactDominatesExpiry = true;
-          CurWarning.CausingFact = LiveInfo.CausingFact;
-          CurWarning.ExpiryLoc = EF->getExpiryLoc();
-          CurWarning.MovedExpr = MovedExpr;
-          CurWarning.InvalidatedByExpr = nullptr;
+          LoanSet HeldLoans = LoanPropagation.getLoans(OID, EF);
+          for (LoanID HeldLoanID : HeldLoans) {
+            const Loan *HeldLoan = FactMgr.getLoanMgr().getLoan(HeldLoanID);
+            if (!ExpiredPath.isPrefixOf(HeldLoan->getAccessPath()))
+              continue;
+            // HeldLoan is expired because its base or itself is expired.
+            PendingWarning &CurWarning = FinalWarningsMap[HeldLoan->getID()];
+            const Expr *MovedExpr = nullptr;
+            if (auto *ME = MovedLoans.getMovedLoans(EF).lookup(HeldLoanID))
+              MovedExpr = *ME;
+            // Skip if we already have a dominating causing fact.
+            if (CurWarning.CausingFactDominatesExpiry)
+              continue;
+            if (causingFactDominatesExpiry(LiveInfo.Kind))
+              CurWarning.CausingFactDominatesExpiry = true;
+            CurWarning.CausingFact = LiveInfo.CausingFact;
+            CurWarning.ExpiryLoc = EF->getExpiryLoc();
+            CurWarning.MovedExpr = MovedExpr;
+            CurWarning.InvalidatedByExpr = nullptr;
+          }
         }
-      }
+  }
+
+  /// Whether an origin is live only because it holds what the function stored
+  /// through a parameter, which escapes at the exit.
+  static bool isParamEscapeCause(CausingFactType CausingFact) {
+    const auto *OEF =
+        dyn_cast_if_present<const OriginEscapesFact *>(CausingFact);
+    return OEF && isa<ParamEscapeFact>(OEF);
   }
 
   /// Checks for use-after-invalidation errors when a container is modified.
@@ -643,25 +723,29 @@ public:
       return false;
     };
     // For each live origin, check if it holds an invalidated loan and report.
+    // As for an expiry, origins live for a use go first.
     LiveOriginSet Origins = LiveOrigins.getLiveOriginsAt(IOF);
-    for (const LivenessMap &Live : {Origins.Persistent, Origins.BlockLocal})
-      for (auto &[OID, LiveInfo] : Live) {
-        LoanSet HeldLoans = LoanPropagation.getLoans(OID, IOF);
-        for (LoanID LiveLoanID : HeldLoans)
-          if (IsInvalidated(FactMgr.getLoanMgr().getLoan(LiveLoanID))) {
-            bool CurDomination = causingFactDominatesExpiry(LiveInfo.Kind);
-            bool LastDomination =
-                FinalWarningsMap.lookup(LiveLoanID).CausingFactDominatesExpiry;
-            if (!LastDomination) {
-              FinalWarningsMap[LiveLoanID] = {
-                  /*ExpiryLoc=*/{},
-                  /*CausingFact=*/LiveInfo.CausingFact,
-                  /*MovedExpr=*/nullptr,
-                  /*InvalidatedByExpr=*/IOF->getInvalidationExpr(),
-                  /*CausingFactDominatesExpiry=*/CurDomination};
+    for (bool ParamEscapes : {false, true})
+      for (const LivenessMap &Live : {Origins.Persistent, Origins.BlockLocal})
+        for (auto &[OID, LiveInfo] : Live) {
+          if (isParamEscapeCause(LiveInfo.CausingFact) != ParamEscapes)
+            continue;
+          LoanSet HeldLoans = LoanPropagation.getLoans(OID, IOF);
+          for (LoanID LiveLoanID : HeldLoans)
+            if (IsInvalidated(FactMgr.getLoanMgr().getLoan(LiveLoanID))) {
+              bool CurDomination = causingFactDominatesExpiry(LiveInfo.Kind);
+              bool LastDomination = FinalWarningsMap.lookup(LiveLoanID)
+                                        .CausingFactDominatesExpiry;
+              if (!LastDomination) {
+                FinalWarningsMap[LiveLoanID] = {
+                    /*ExpiryLoc=*/{},
+                    /*CausingFact=*/LiveInfo.CausingFact,
+                    /*MovedExpr=*/nullptr,
+                    /*InvalidatedByExpr=*/IOF->getInvalidationExpr(),
+                    /*CausingFactDominatesExpiry=*/CurDomination};
+              }
             }
-          }
-      }
+        }
   }
 
   void issuePendingWarnings() {
@@ -744,6 +828,16 @@ public:
             else if (InvalidatedPVD)
               SemaHelper->reportUseAfterInvalidation(
                   InvalidatedPVD, Use, Warning.InvalidatedByExpr, ExprChain);
+          } else if (const auto *ParamEscape = dyn_cast<ParamEscapeFact>(OEF)) {
+            // A loan stored through a parameter and still held there at the
+            // exit was invalidated.
+            UseSite Use = UseSite::at(ParamEscape->getLoc());
+            if (IssueExpr)
+              SemaHelper->reportUseAfterInvalidation(
+                  IssueExpr, Use, Warning.InvalidatedByExpr, ExprChain);
+            else if (InvalidatedPVD)
+              SemaHelper->reportUseAfterInvalidation(
+                  InvalidatedPVD, Use, Warning.InvalidatedByExpr, ExprChain);
           } else
             llvm_unreachable("Unhandled OriginEscapesFact type");
         } else if (const auto *RetEscape = dyn_cast<ReturnEscapeFact>(OEF)) {
@@ -775,6 +869,13 @@ public:
               ExpiryLoc,
               getExprChain(
                   LoanPropagation.buildOriginFlowChain(OEF, LID, Cfg)));
+        else if (const auto *ParamEscape = dyn_cast<ParamEscapeFact>(OEF))
+          // A borrow stored through a parameter is still held there, where
+          // the caller sees it, when the borrowed local goes out of scope;
+          // reuse the use-after-scope diagnostic at the function's exit.
+          SemaHelper->reportUseAfterScope(IssueExpr,
+                                          UseSite::at(ParamEscape->getLoc()),
+                                          MovedExpr, ExpiryLoc, ExprChain);
         else
           llvm_unreachable("Unhandled OriginEscapesFact type");
       } else
